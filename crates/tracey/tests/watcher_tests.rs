@@ -142,7 +142,7 @@ async fn create_test_service() -> tracey::daemon::TraceyService {
     use tracey::daemon::{Engine, TraceyService};
 
     let fixtures = common::fixtures_dir();
-    let config_path = fixtures.join("config.yaml");
+    let config_path = fixtures.join("config.styx");
 
     let engine = Arc::new(
         Engine::new(fixtures, config_path)
@@ -158,7 +158,7 @@ async fn create_test_service_with_watcher() -> (tracey::daemon::TraceyService, A
     use tracey::daemon::{Engine, TraceyService};
 
     let fixtures = common::fixtures_dir();
-    let config_path = fixtures.join("config.yaml");
+    let config_path = fixtures.join("config.styx");
 
     let engine = Arc::new(
         Engine::new(fixtures, config_path)
@@ -171,7 +171,8 @@ async fn create_test_service_with_watcher() -> (tracey::daemon::TraceyService, A
     watcher_state.set_watched_dirs(vec!["/test/dir".into()]);
     watcher_state.record_event();
 
-    let service = TraceyService::new_with_watcher(engine, Arc::clone(&watcher_state));
+    let (service, _shutdown_rx) =
+        TraceyService::new_with_watcher(engine, Arc::clone(&watcher_state));
 
     (service, watcher_state)
 }
@@ -181,7 +182,7 @@ async fn test_health_without_watcher_state() {
     use tracey_proto::TraceyDaemon;
 
     let service = Arc::new(create_test_service().await);
-    let health = service.health().await.expect("health() failed");
+    let health = service.health().await;
 
     // Without watcher state, defaults are returned
     assert!(!health.watcher_active);
@@ -198,7 +199,7 @@ async fn test_health_with_watcher_state() {
 
     let (service, _state) = create_test_service_with_watcher().await;
     let service = Arc::new(service);
-    let health = service.health().await.expect("health() failed");
+    let health = service.health().await;
 
     assert!(health.watcher_active);
     assert!(health.watcher_error.is_none());
@@ -218,7 +219,7 @@ async fn test_health_reports_watcher_error() {
     state.mark_failed("Connection lost".to_string());
 
     let service = Arc::new(service);
-    let health = service.health().await.expect("health() failed");
+    let health = service.health().await;
 
     assert!(!health.watcher_active);
     assert_eq!(health.watcher_error, Some("Connection lost".to_string()));
@@ -233,7 +234,7 @@ async fn test_engine_rebuild_increments_version() {
     use tracey::daemon::Engine;
 
     let fixtures = common::fixtures_dir();
-    let config_path = fixtures.join("config.yaml");
+    let config_path = fixtures.join("config.styx");
 
     let engine = Arc::new(
         Engine::new(fixtures, config_path)

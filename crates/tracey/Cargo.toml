@@ -32,11 +32,14 @@ path = "src/main.rs"
 tracey-core = { workspace = true, features = ["walk", "parallel", "reverse"] }
 tracey-api = { path = "../tracey-api" }
 tracey-proto = { path = "../tracey-proto" }
+tracey-config = { workspace = true }
 
 # Facet ecosystem for config parsing and CLI
 facet = { workspace = true }
 facet-args = { workspace = true }
 facet-yaml = { workspace = true }
+facet-styx = { workspace = true }
+styx-embed = { workspace = true }
 facet-json = { workspace = true }
 facet-axum = { workspace = true }
 
@@ -46,6 +49,7 @@ facet-error = { workspace = true }
 
 # Pretty output
 owo-colors = { workspace = true }
+indoc = "2"
 
 # File walking (for include patterns)
 ignore = { workspace = true }
@@ -65,7 +69,7 @@ futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-notify-debouncer-mini = { workspace = true }
+notify = { workspace = true }
 
 # URL decoding for API
 urlencoding = "2.1"
@@ -77,7 +81,7 @@ blake3 = "1.5"
 tantivy = { workspace = true, optional = true }
 
 # MCP server
-rust-mcp-sdk = { version = "0.8", features = ["server", "macros"] }
+rust-mcp-sdk = { version = "0.8", default-features = false, features = ["stdio", "server", "macros"] }
 async-trait = "0.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
@@ -92,6 +96,7 @@ open = "5"
 # roam RPC framework (for daemon architecture)
 roam = { git = "https://github.com/bearcove/roam", branch = "main" }
 roam-stream = { git = "https://github.com/bearcove/roam", branch = "main" }
+roam-local = { git = "https://github.com/bearcove/roam", branch = "main" }
 
 [features]
 default = ["search"]
@@ -99,7 +104,9 @@ search = ["dep:tantivy"]
 
 [build-dependencies]
 tracey-api = { path = "../tracey-api" }
+tracey-config = { workspace = true }
 facet-typescript = { git = "https://github.com/facet-rs/facet", branch = "main" }
+facet-styx = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.24.0"

@@ -14,8 +14,13 @@ use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use crate::daemon::DaemonClient;
+use crate::daemon::{DaemonClient, new_client};
 use tracey_proto::*;
+
+/// Convert roam RPC result to a simple Result
+fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam_stream::CallError<E>>) -> Result<T, String> {
+    res.map_err(|e| format!("RPC error: {:?}", e))
+}
 
 // Semantic token types for requirement references
 const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
@@ -52,13 +57,16 @@ async fn run_lsp_server(project_root: PathBuf) -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
+    // Create daemon client (connects lazily, auto-reconnects)
+    let daemon_client = new_client(project_root.clone());
+
     let (service, socket) = LspService::new(|client| Backend {
         client,
         state: tokio::sync::Mutex::new(LspState {
             documents: HashMap::new(),
-            project_root: project_root.clone(),
-            daemon_client: None,
+            daemon_client,
             files_with_diagnostics: std::collections::HashSet::new(),
+            project_root: project_root.clone(),
         }),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -74,24 +82,16 @@ struct Backend {
 struct LspState {
     /// Document content cache: uri -> content
     documents: HashMap<String, String>,
-    /// Project root for resolving paths
-    project_root: PathBuf,
-    /// Client connection to daemon (lazy-initialized)
-    daemon_client: Option<DaemonClient>,
+    /// Client connection to daemon (connects lazily, auto-reconnects)
+    daemon_client: DaemonClient,
     /// Files that have been published with non-empty diagnostics.
     /// Used to clear diagnostics when issues are fixed.
     files_with_diagnostics: std::collections::HashSet<String>,
+    /// Project root path
+    project_root: PathBuf,
 }
 
 impl LspState {
-    /// Get or create daemon client connection.
-    async fn get_daemon_client(&mut self) -> Result<&mut DaemonClient> {
-        if self.daemon_client.is_none() {
-            self.daemon_client = Some(DaemonClient::connect(&self.project_root).await?);
-        }
-        Ok(self.daemon_client.as_mut().unwrap())
-    }
-
     /// Store document content when opened.
     fn document_opened(&mut self, uri: &Url, content: String) {
         self.documents.insert(uri.to_string(), content);
@@ -135,15 +135,11 @@ impl Backend {
         };
 
         let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return;
-        };
-
         let req = LspDocumentRequest {
             path: path.clone(),
             content,
         };
-        let Ok(daemon_diagnostics) = client.lsp_diagnostics(req).await else {
+        let Ok(daemon_diagnostics) = rpc(state.daemon_client.lsp_diagnostics(req).await) else {
             return;
         };
 
@@ -190,56 +186,51 @@ impl Backend {
     /// Notify daemon that a file was opened.
     async fn notify_vfs_open(&self, uri: &Url, content: &str) {
         if let Ok(path) = uri.to_file_path() {
-            let mut state = self.state().await;
-            if let Ok(client) = state.get_daemon_client().await {
-                let _ = client
-                    .vfs_open(path.to_string_lossy().into_owned(), content.to_string())
-                    .await;
-            }
+            let state = self.state().await;
+            let _ = state
+                .daemon_client
+                .vfs_open(path.to_string_lossy().into_owned(), content.to_string())
+                .await;
         }
     }
 
     /// Notify daemon that a file changed.
     async fn notify_vfs_change(&self, uri: &Url, content: &str) {
         if let Ok(path) = uri.to_file_path() {
-            let mut state = self.state().await;
-            if let Ok(client) = state.get_daemon_client().await {
-                let _ = client
-                    .vfs_change(path.to_string_lossy().into_owned(), content.to_string())
-                    .await;
-            }
+            let state = self.state().await;
+            let _ = state
+                .daemon_client
+                .vfs_change(path.to_string_lossy().into_owned(), content.to_string())
+                .await;
         }
     }
 
     /// Notify daemon that a file was closed.
     async fn notify_vfs_close(&self, uri: &Url) {
         if let Ok(path) = uri.to_file_path() {
-            let mut state = self.state().await;
-            if let Ok(client) = state.get_daemon_client().await {
-                let _ = client.vfs_close(path.to_string_lossy().into_owned()).await;
-            }
+            let state = self.state().await;
+            let _ = state
+                .daemon_client
+                .vfs_close(path.to_string_lossy().into_owned())
+                .await;
         }
     }
 
     /// Publish diagnostics for all files in the workspace.
-    ///
-    /// r[impl lsp.diagnostics.workspace]
-    /// r[impl lsp.diagnostics.clear-fixed]
     async fn publish_workspace_diagnostics(&self) {
         let project_root = self.state().await.project_root.clone();
 
         // First, gather all data we need from daemon while holding lock
         let (config_error, all_diagnostics, files_to_clear) = {
             let mut state = self.state().await;
-            let Ok(client) = state.get_daemon_client().await else {
-                return;
-            };
 
             // Check for config errors
-            let config_error = client.health().await.ok().and_then(|h| h.config_error);
+            let config_error = rpc(state.daemon_client.health().await)
+                .ok()
+                .and_then(|h| h.config_error);
 
             // Get workspace diagnostics
-            let all_diagnostics = match client.lsp_workspace_diagnostics().await {
+            let all_diagnostics = match rpc(state.daemon_client.lsp_workspace_diagnostics().await) {
                 Ok(d) => d,
                 Err(_) => return,
             };
@@ -266,7 +257,7 @@ impl Backend {
         // Lock is now released
 
         // Publish config error diagnostic on config file
-        let config_path = project_root.join(".config/tracey/config.yaml");
+        let config_path = project_root.join(".config/tracey/config.styx");
         if let Ok(uri) = Url::from_file_path(&config_path) {
             if let Some(error_msg) = config_error {
                 let diagnostic = Diagnostic {
@@ -456,11 +447,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = LspPositionRequest {
             path,
             content,
@@ -468,7 +455,7 @@ impl LanguageServer for Backend {
             character: position.character,
         };
 
-        let Ok(completions) = client.lsp_completions(req).await else {
+        let Ok(completions) = rpc(state.daemon_client.lsp_completions(req).await) else {
             return Ok(None);
         };
 
@@ -505,11 +492,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = LspPositionRequest {
             path,
             content,
@@ -517,7 +500,7 @@ impl LanguageServer for Backend {
             character: position.character,
         };
 
-        let Ok(Some(info)) = client.lsp_hover(req).await else {
+        let Ok(Some(info)) = rpc(state.daemon_client.lsp_hover(req).await) else {
             return Ok(None);
         };
 
@@ -593,13 +576,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let project_root = self.state().await.project_root.clone();
-
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
+        let project_root = state.project_root.clone();
         let req = LspPositionRequest {
             path,
             content,
@@ -607,7 +585,7 @@ impl LanguageServer for Backend {
             character: position.character,
         };
 
-        let Ok(locations) = client.lsp_definition(req).await else {
+        let Ok(locations) = rpc(state.daemon_client.lsp_definition(req).await) else {
             return Ok(None);
         };
 
@@ -646,13 +624,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let project_root = self.state().await.project_root.clone();
-
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
+        let project_root = state.project_root.clone();
         let req = LspPositionRequest {
             path,
             content,
@@ -660,7 +633,7 @@ impl LanguageServer for Backend {
             character: position.character,
         };
 
-        let Ok(locations) = client.lsp_implementation(req).await else {
+        let Ok(locations) = rpc(state.daemon_client.lsp_implementation(req).await) else {
             return Ok(None);
         };
 
@@ -699,13 +672,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let project_root = self.state().await.project_root.clone();
-
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
+        let project_root = state.project_root.clone();
         let req = LspReferencesRequest {
             path,
             content,
@@ -714,7 +682,7 @@ impl LanguageServer for Backend {
             include_declaration: params.context.include_declaration,
         };
 
-        let Ok(locations) = client.lsp_references(req).await else {
+        let Ok(locations) = rpc(state.daemon_client.lsp_references(req).await) else {
             return Ok(None);
         };
 
@@ -756,11 +724,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = LspPositionRequest {
             path,
             content,
@@ -768,7 +732,7 @@ impl LanguageServer for Backend {
             character: position.character,
         };
 
-        let Ok(locations) = client.lsp_document_highlight(req).await else {
+        let Ok(locations) = rpc(state.daemon_client.lsp_document_highlight(req).await) else {
             return Ok(None);
         };
 
@@ -806,14 +770,10 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = LspDocumentRequest { path, content };
 
-        let Ok(symbols) = client.lsp_document_symbols(req).await else {
+        let Ok(symbols) = rpc(state.daemon_client.lsp_document_symbols(req).await) else {
             return Ok(None);
         };
 
@@ -855,14 +815,14 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
-        let project_root = self.state().await.project_root.clone();
+        let state = self.state().await;
+        let project_root = state.project_root.clone();
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
-        let Ok(symbols) = client.lsp_workspace_symbols(params.query).await else {
+        let Ok(symbols) = rpc(state
+            .daemon_client
+            .lsp_workspace_symbols(params.query)
+            .await)
+        else {
             return Ok(None);
         };
 
@@ -910,11 +870,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = LspPositionRequest {
             path,
             content,
@@ -922,7 +878,7 @@ impl LanguageServer for Backend {
             character: position.character,
         };
 
-        let Ok(actions) = client.lsp_code_actions(req).await else {
+        let Ok(actions) = rpc(state.daemon_client.lsp_code_actions(req).await) else {
             return Ok(None);
         };
 
@@ -962,14 +918,10 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = LspDocumentRequest { path, content };
 
-        let Ok(lenses) = client.lsp_code_lens(req).await else {
+        let Ok(lenses) = rpc(state.daemon_client.lsp_code_lens(req).await) else {
             return Ok(None);
         };
 
@@ -1014,11 +966,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = InlayHintsRequest {
             path,
             content,
@@ -1026,7 +974,7 @@ impl LanguageServer for Backend {
             end_line: params.range.end.line,
         };
 
-        let Ok(hints) = client.lsp_inlay_hints(req).await else {
+        let Ok(hints) = rpc(state.daemon_client.lsp_inlay_hints(req).await) else {
             return Ok(None);
         };
 
@@ -1065,11 +1013,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = LspPositionRequest {
             path,
             content,
@@ -1077,7 +1021,7 @@ impl LanguageServer for Backend {
             character: position.character,
         };
 
-        let Ok(Some(result)) = client.lsp_prepare_rename(req).await else {
+        let Ok(Some(result)) = rpc(state.daemon_client.lsp_prepare_rename(req).await) else {
             return Ok(None);
         };
 
@@ -1104,13 +1048,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let project_root = self.state().await.project_root.clone();
-
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
+        let project_root = state.project_root.clone();
         let req = LspRenameRequest {
             path,
             content,
@@ -1119,7 +1058,7 @@ impl LanguageServer for Backend {
             new_name: params.new_name,
         };
 
-        let Ok(edits) = client.lsp_rename(req).await else {
+        let Ok(edits) = rpc(state.daemon_client.lsp_rename(req).await) else {
             return Ok(None);
         };
 
@@ -1166,14 +1105,10 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let mut state = self.state().await;
-        let Ok(client) = state.get_daemon_client().await else {
-            return Ok(None);
-        };
-
+        let state = self.state().await;
         let req = LspDocumentRequest { path, content };
 
-        let Ok(tokens) = client.lsp_semantic_tokens(req).await else {
+        let Ok(tokens) = rpc(state.daemon_client.lsp_semantic_tokens(req).await) else {
             return Ok(None);
         };
 

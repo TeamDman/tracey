@@ -1,7 +1,5 @@
 //! File watcher with smart directory watching and health monitoring.
 //!
-//! r[impl daemon.watcher.smart-watch]
-//!
 //! Instead of watching the entire project root and filtering events,
 //! this module extracts directory prefixes from config glob patterns
 //! and only watches those specific directories.
@@ -11,10 +9,9 @@
 //! - `WatcherManager` handles watch setup and reconfiguration
 //! - `WatcherState` tracks health status for monitoring
 //! - `WatcherEvent` is sent to the rebuild loop
+//! - Events are batched (not debounced/merged) and delivered at most every N ms
 //!
 //! ## Reconfiguration
-//!
-//! r[impl daemon.watcher.reconfigure]
 //!
 //! When config.yaml or .gitignore changes, the watcher sends a
 //! `Reconfigure` event. The rebuild loop then:
@@ -25,15 +22,33 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eyre::{Result, WrapErr};
-use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
-use tracing::{debug, info, warn};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
+
+// ============================================================================
+// Event Filtering
+// ============================================================================
+
+/// Check if a notify event represents an actual file change.
+///
+/// On Linux, the notify crate emits `Access` events when files are opened/closed,
+/// which can cause infinite loops when tracey reads its own config file. We filter
+/// these out and only process events that represent actual mutations:
+/// - `Create`: File or directory was created
+/// - `Modify`: File content, metadata, or name changed
+/// - `Remove`: File or directory was deleted
+fn is_mutation_event(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    )
+}
 
 // ============================================================================
 // Watcher Events
@@ -42,12 +57,10 @@ use crate::config::Config;
 /// Events sent from the watcher to the rebuild loop.
 #[derive(Debug)]
 pub enum WatcherEvent {
-    /// Files changed - contains the list of changed file paths.
-    FilesChanged(Vec<PathBuf>),
+    /// Files changed - contains the list of raw notify events.
+    FilesChanged(Vec<Event>),
 
     /// Config or gitignore changed - triggers reconfiguration.
-    ///
-    /// r[impl daemon.watcher.reconfigure]
     Reconfigure,
 }
 
@@ -56,8 +69,6 @@ pub enum WatcherEvent {
 // ============================================================================
 
 /// Shared state for monitoring watcher health.
-///
-/// r[impl daemon.health]
 ///
 /// This struct is shared between the watcher thread and the main daemon.
 /// It allows the health endpoint to report on watcher status.
@@ -97,8 +108,6 @@ impl WatcherState {
     }
 
     /// Mark the watcher as failed with an error message.
-    ///
-    /// r[impl daemon.watcher.auto-restart]
     pub fn mark_failed(&self, error: String) {
         self.active.store(false, Ordering::SeqCst);
         *self.error.write().unwrap() = Some(error);
@@ -164,8 +173,6 @@ impl Default for WatcherState {
 
 /// Extract the directory prefix from a glob pattern.
 ///
-/// r[impl daemon.watcher.smart-watch]
-///
 /// This finds the longest path prefix before any glob metacharacter.
 ///
 /// # Examples
@@ -207,13 +214,33 @@ pub fn glob_to_watch_dir(pattern: &str) -> PathBuf {
 pub fn extract_watch_dirs_from_config(config: &Config, project_root: &Path) -> HashSet<PathBuf> {
     let mut dirs = HashSet::new();
 
+    // Canonicalize project root for comparison
+    let canonical_project_root = project_root.canonicalize().ok();
+
     for spec in &config.specs {
         // Spec include patterns (e.g., "docs/spec/**/*.md")
         for include in &spec.include {
+            // Skip external paths (starting with ..) - they're in other repos
+            // and shouldn't be watched for changes
+            if include.starts_with("..") {
+                debug!("Skipping external spec path (not watching): {}", include);
+                continue;
+            }
+
             let dir = glob_to_watch_dir(include);
             let full_path = project_root.join(&dir);
             // Canonicalize to resolve .. components and get clean absolute paths
             if let Ok(canonical) = full_path.canonicalize() {
+                // Double-check it's inside the project root
+                if let Some(ref root) = canonical_project_root
+                    && !canonical.starts_with(root)
+                {
+                    debug!(
+                        "Skipping path outside project root: {}",
+                        canonical.display()
+                    );
+                    continue;
+                }
                 dirs.insert(canonical);
             } else {
                 debug!(
@@ -247,16 +274,88 @@ pub fn extract_watch_dirs_from_config(config: &Config, project_root: &Path) -> H
 }
 
 // ============================================================================
+// Event Batcher
+// ============================================================================
+
+/// Batches raw notify events and delivers them at most every `batch_duration`.
+///
+/// Unlike debouncing which merges events, this preserves all raw events
+/// and simply batches them for delivery.
+struct EventBatcher<F> {
+    /// Accumulated events waiting to be delivered.
+    pending_events: Vec<Event>,
+
+    /// When the current batch started (first event received).
+    batch_start: Option<Instant>,
+
+    /// How long to wait before delivering a batch.
+    batch_duration: Duration,
+
+    /// Callback to deliver batched events.
+    on_batch: F,
+}
+
+impl<F> EventBatcher<F>
+where
+    F: FnMut(Vec<Event>),
+{
+    fn new(batch_duration: Duration, on_batch: F) -> Self {
+        Self {
+            pending_events: Vec::new(),
+            batch_start: None,
+            batch_duration,
+            on_batch,
+        }
+    }
+
+    /// Add an event to the current batch.
+    ///
+    /// Events that don't represent actual file mutations (like `Access` events
+    /// on Linux) are filtered out to prevent infinite rebuild loops.
+    fn push(&mut self, event: Event) {
+        // Filter out non-mutation events (e.g., Access events on Linux)
+        if !is_mutation_event(&event) {
+            trace!(?event, "ignoring non-mutation event");
+            return;
+        }
+
+        debug!(?event, "notify event");
+
+        if self.batch_start.is_none() {
+            self.batch_start = Some(Instant::now());
+        }
+        self.pending_events.push(event);
+    }
+
+    /// Check if the batch is ready to be delivered.
+    fn should_flush(&self) -> bool {
+        if let Some(start) = self.batch_start {
+            start.elapsed() >= self.batch_duration
+        } else {
+            false
+        }
+    }
+
+    /// Deliver the current batch if ready.
+    fn flush_if_ready(&mut self) {
+        if self.should_flush() && !self.pending_events.is_empty() {
+            let events = std::mem::take(&mut self.pending_events);
+            self.batch_start = None;
+
+            debug!(count = events.len(), "delivering batched events");
+            (self.on_batch)(events);
+        }
+    }
+}
+
+// ============================================================================
 // Watcher Manager
 // ============================================================================
 
 /// Manages file watching with dynamic reconfiguration.
-///
-/// r[impl daemon.watcher.smart-watch]
-/// r[impl daemon.watcher.reconfigure]
 pub struct WatcherManager {
-    /// The underlying debounced watcher.
-    debouncer: Debouncer<RecommendedWatcher>,
+    /// The underlying raw watcher.
+    watcher: RecommendedWatcher,
 
     /// Currently watched directories.
     watched_dirs: HashSet<PathBuf>,
@@ -272,26 +371,57 @@ pub struct WatcherManager {
 }
 
 impl WatcherManager {
-    /// Create a new watcher manager.
+    /// Create a new watcher manager with event batching.
+    ///
+    /// Events are batched and delivered at most every `batch_duration`.
+    /// All raw events are preserved (no merging/deduplication).
     ///
     /// The watcher starts with no directories watched. Call `reconfigure()`
     /// after creation to set up watches based on config.
     pub fn new<F>(
         project_root: PathBuf,
         config_path: PathBuf,
-        debounce_duration: Duration,
+        batch_duration: Duration,
         event_handler: F,
     ) -> Result<Self>
     where
-        F: Fn(DebounceEventResult) + Send + 'static,
+        F: Fn(Vec<Event>) + Send + 'static,
     {
-        let debouncer = new_debouncer(debounce_duration, event_handler)
-            .wrap_err("Failed to create file watcher")?;
+        // Wrap the handler in a batcher protected by a mutex
+        let batcher = Arc::new(Mutex::new(EventBatcher::new(batch_duration, event_handler)));
+        let batcher_for_watcher = Arc::clone(&batcher);
+
+        // Spawn a timer task to periodically flush batched events
+        let batcher_for_timer = Arc::clone(&batcher);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(batch_duration / 2);
+                if let Ok(mut b) = batcher_for_timer.lock() {
+                    b.flush_if_ready();
+                }
+            }
+        });
+
+        let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            match res {
+                Ok(event) => {
+                    if let Ok(mut b) = batcher_for_watcher.lock() {
+                        b.push(event);
+                        // Also check if we should flush immediately
+                        b.flush_if_ready();
+                    }
+                }
+                Err(e) => {
+                    warn!("File watcher error: {:?}", e);
+                }
+            }
+        })
+        .wrap_err("Failed to create file watcher")?;
 
         let gitignore_path = project_root.join(".gitignore");
 
         let mut manager = Self {
-            debouncer,
+            watcher,
             watched_dirs: HashSet::new(),
             project_root,
             config_path,
@@ -308,8 +438,7 @@ impl WatcherManager {
     fn watch_static_paths(&mut self) -> Result<()> {
         // Watch config file
         if self.config_path.exists() {
-            self.debouncer
-                .watcher()
+            self.watcher
                 .watch(&self.config_path, RecursiveMode::NonRecursive)
                 .wrap_err_with(|| {
                     format!(
@@ -322,8 +451,7 @@ impl WatcherManager {
 
         // Watch .gitignore if it exists
         if self.gitignore_path.exists() {
-            self.debouncer
-                .watcher()
+            self.watcher
                 .watch(&self.gitignore_path, RecursiveMode::NonRecursive)
                 .wrap_err_with(|| {
                     format!(
@@ -339,8 +467,6 @@ impl WatcherManager {
 
     /// Reconfigure watches based on config patterns.
     ///
-    /// r[impl daemon.watcher.reconfigure]
-    ///
     /// This is called on startup and whenever config changes.
     /// It computes the new set of watch directories, removes watches
     /// for directories no longer needed, and adds watches for new ones.
@@ -353,7 +479,7 @@ impl WatcherManager {
 
         // Remove old watches
         for dir in &to_remove {
-            match self.debouncer.watcher().unwatch(dir) {
+            match self.watcher.unwatch(dir) {
                 Ok(()) => {
                     debug!("Stopped watching: {}", dir.display());
                 }
@@ -370,11 +496,7 @@ impl WatcherManager {
 
         // Add new watches
         for dir in &to_add {
-            match self
-                .debouncer
-                .watcher()
-                .watch(dir, RecursiveMode::Recursive)
-            {
+            match self.watcher.watch(dir, RecursiveMode::Recursive) {
                 Ok(()) => {
                     info!("Watching directory: {}", dir.display());
                 }
@@ -521,5 +643,95 @@ mod tests {
         assert_eq!(dirs.len(), 2);
         assert!(dirs.contains(&PathBuf::from("/foo")));
         assert!(dirs.contains(&PathBuf::from("/bar")));
+    }
+
+    // Tests for is_mutation_event - filtering out Access events (fixes #42)
+
+    fn make_event(kind: EventKind) -> Event {
+        Event {
+            kind,
+            paths: vec![PathBuf::from("/test/file.rs")],
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_is_mutation_event_create() {
+        use notify::event::CreateKind;
+
+        assert!(is_mutation_event(&make_event(EventKind::Create(
+            CreateKind::File
+        ))));
+        assert!(is_mutation_event(&make_event(EventKind::Create(
+            CreateKind::Folder
+        ))));
+        assert!(is_mutation_event(&make_event(EventKind::Create(
+            CreateKind::Any
+        ))));
+    }
+
+    #[test]
+    fn test_is_mutation_event_modify() {
+        use notify::event::{DataChange, MetadataKind, ModifyKind, RenameMode};
+
+        assert!(is_mutation_event(&make_event(EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        ))));
+        assert!(is_mutation_event(&make_event(EventKind::Modify(
+            ModifyKind::Data(DataChange::Size)
+        ))));
+        assert!(is_mutation_event(&make_event(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        ))));
+        assert!(is_mutation_event(&make_event(EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both)
+        ))));
+        assert!(is_mutation_event(&make_event(EventKind::Modify(
+            ModifyKind::Any
+        ))));
+    }
+
+    #[test]
+    fn test_is_mutation_event_remove() {
+        use notify::event::RemoveKind;
+
+        assert!(is_mutation_event(&make_event(EventKind::Remove(
+            RemoveKind::File
+        ))));
+        assert!(is_mutation_event(&make_event(EventKind::Remove(
+            RemoveKind::Folder
+        ))));
+        assert!(is_mutation_event(&make_event(EventKind::Remove(
+            RemoveKind::Any
+        ))));
+    }
+
+    #[test]
+    fn test_is_mutation_event_rejects_access() {
+        use notify::event::{AccessKind, AccessMode};
+
+        // These are the events that cause infinite loops on Linux
+        assert!(!is_mutation_event(&make_event(EventKind::Access(
+            AccessKind::Open(AccessMode::Any)
+        ))));
+        assert!(!is_mutation_event(&make_event(EventKind::Access(
+            AccessKind::Open(AccessMode::Read)
+        ))));
+        assert!(!is_mutation_event(&make_event(EventKind::Access(
+            AccessKind::Close(AccessMode::Any)
+        ))));
+        assert!(!is_mutation_event(&make_event(EventKind::Access(
+            AccessKind::Read
+        ))));
+        assert!(!is_mutation_event(&make_event(EventKind::Access(
+            AccessKind::Any
+        ))));
+    }
+
+    #[test]
+    fn test_is_mutation_event_rejects_other() {
+        // Any and Other events should also be rejected
+        assert!(!is_mutation_event(&make_event(EventKind::Any)));
+        assert!(!is_mutation_event(&make_event(EventKind::Other)));
     }
 }

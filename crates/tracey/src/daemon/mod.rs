@@ -3,13 +3,15 @@
 //! r[impl daemon.state.single-source]
 //!
 //! The daemon owns the `DashboardData` and exposes the `TraceyDaemon` RPC service
-//! over a Unix socket. HTTP, MCP, and LSP bridges connect as clients.
+//! over local IPC (Unix sockets on Unix, named pipes on Windows).
+//! HTTP, MCP, and LSP bridges connect as clients.
 //!
 //! ## Socket Location
 //!
 //! r[impl daemon.lifecycle.socket]
 //!
-//! The daemon listens on `.tracey/daemon.sock` in the workspace root.
+//! The daemon listens on `.tracey/daemon.sock` in the workspace root (Unix)
+//! or a named pipe derived from the workspace path (Windows).
 //!
 //! ## Lifecycle
 //!
@@ -23,18 +25,18 @@ pub mod service;
 pub mod watcher;
 
 use eyre::{Result, WrapErr};
-use roam_stream::{CobsFramed, ConnectionError, Hello, hello_exchange_acceptor};
+use roam_local::LocalListener;
+use roam_stream::{ConnectionError, HandshakeConfig, accept};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::UnixListener;
 use tracing::{debug, error, info, warn};
 
 use service::TraceyDaemonDispatcher;
 use watcher::{WatcherEvent, WatcherManager, WatcherState};
 
-pub use client::{DaemonClient, ReconnectingClient};
+pub use client::{DaemonClient, DaemonConnector, new_client};
 pub use engine::Engine;
 pub use service::TraceyService;
 pub use watcher::WatcherState as DaemonWatcherState;
@@ -42,14 +44,41 @@ pub use watcher::WatcherState as DaemonWatcherState;
 /// Default idle timeout in seconds (10 minutes)
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
-/// Socket file name within .tracey directory
+/// Socket file name within .tracey directory (Unix only)
+#[cfg(unix)]
 const SOCKET_FILENAME: &str = "daemon.sock";
 
-/// Get the socket path for a workspace.
+/// Get the local IPC endpoint for a workspace.
+///
+/// On Unix, this returns a path to `.tracey/daemon.sock`.
+/// On Windows, this returns a named pipe path like `\\.\pipe\tracey-{hash}`.
 ///
 /// r[impl daemon.roam.unix-socket]
-pub fn socket_path(project_root: &Path) -> PathBuf {
+#[cfg(unix)]
+pub fn local_endpoint(project_root: &Path) -> PathBuf {
     project_root.join(".tracey").join(SOCKET_FILENAME)
+}
+
+/// Get the local IPC endpoint for a workspace.
+///
+/// On Unix, this returns a path to `.tracey/daemon.sock`.
+/// On Windows, this returns a named pipe path like `\\.\pipe\tracey-{hash}`.
+#[cfg(windows)]
+pub fn local_endpoint(project_root: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    project_root.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    format!(r"\\.\pipe\tracey-{:016x}", hash)
+}
+
+/// Legacy alias for `local_endpoint` (Unix only).
+#[cfg(unix)]
+pub fn socket_path(project_root: &Path) -> PathBuf {
+    local_endpoint(project_root)
 }
 
 /// Ensure the .tracey directory exists and is gitignored.
@@ -101,14 +130,17 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
     // Ensure .tracey directory exists
     ensure_tracey_dir(&project_root)?;
 
-    // Create socket path
-    let sock_path = socket_path(&project_root);
+    // Get local IPC endpoint
+    let endpoint = local_endpoint(&project_root);
 
     // r[impl daemon.lifecycle.stale-socket]
-    // Remove stale socket if it exists
-    if sock_path.exists() {
-        info!("Removing stale socket at {}", sock_path.display());
-        std::fs::remove_file(&sock_path)?;
+    // Remove stale endpoint if it exists (no-op on Windows)
+    if roam_local::endpoint_exists(&endpoint) {
+        #[cfg(unix)]
+        info!("Removing stale socket at {}", endpoint.display());
+        #[cfg(windows)]
+        info!("Removing stale endpoint");
+        let _ = roam_local::remove_endpoint(&endpoint);
     }
 
     // Create engine
@@ -119,17 +151,16 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
     );
 
     // r[impl daemon.state.file-watcher]
-    // r[impl daemon.watcher.smart-watch]
     // Set up file watcher with smart directory watching
     let watcher_state = WatcherState::new();
 
     // Create service with watcher state for health monitoring
     // TraceyService is cheap to clone (holds Arc internally)
-    let service = TraceyService::new_with_watcher(Arc::clone(&engine), Arc::clone(&watcher_state));
+    let (service, mut shutdown_rx) =
+        TraceyService::new_with_watcher(Arc::clone(&engine), Arc::clone(&watcher_state));
     let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::channel::<WatcherEvent>(16);
 
     // Spawn file watcher in a separate OS thread with auto-restart
-    // r[impl daemon.watcher.auto-restart]
     let config_path_for_watcher = config_path.clone();
     let project_root_for_watcher = project_root.clone();
     let watcher_state_for_thread = Arc::clone(&watcher_state);
@@ -182,7 +213,6 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
 
         while let Some(event) = watcher_rx.recv().await {
             match event {
-                // r[impl daemon.watcher.reconfigure]
                 WatcherEvent::Reconfigure => {
                     info!("Config or gitignore changed, reconfiguring watcher");
 
@@ -196,7 +226,13 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                     }
                 }
 
-                WatcherEvent::FilesChanged(changed_files) => {
+                WatcherEvent::FilesChanged(events) => {
+                    // Extract all paths from the batch of events
+                    let changed_files: Vec<PathBuf> = events
+                        .iter()
+                        .flat_map(|e| e.paths.iter().cloned())
+                        .collect();
+
                     // r[impl server.watch.patterns-from-config]
                     // Collect all include patterns from config
                     let mut include_patterns: Vec<String> = Vec::new();
@@ -305,17 +341,22 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
         }
     });
 
-    // Bind Unix socket
-    let listener = UnixListener::bind(&sock_path)
-        .wrap_err_with(|| format!("Failed to bind socket at {}", sock_path.display()))?;
+    // Bind local IPC listener
+    // Note: on Windows, accept() takes &mut self (to swap server instances)
+    #[cfg(unix)]
+    let listener = LocalListener::bind(&endpoint)
+        .wrap_err_with(|| format!("Failed to bind socket at {}", endpoint.display()))?;
+    #[cfg(windows)]
+    let mut listener =
+        LocalListener::bind(&endpoint).wrap_err_with(|| "Failed to bind named pipe")?;
 
-    info!("Daemon listening on {}", sock_path.display());
+    #[cfg(unix)]
+    info!("Daemon listening on {}", endpoint.display());
+    #[cfg(windows)]
+    info!("Daemon listening on {}", endpoint);
 
-    // Default Hello configuration
-    let hello = Hello::V1 {
-        max_payload_size: 1024 * 1024,     // 1MB max payload
-        initial_channel_credit: 64 * 1024, // 64KB channel credit
-    };
+    // Default handshake configuration
+    let handshake_config = HandshakeConfig::default();
 
     // r[impl daemon.lifecycle.idle-timeout]
     // Track active connections and last activity for idle timeout
@@ -327,11 +368,21 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
 
     // Accept connections and handle roam RPC
     loop {
-        // Check idle timeout every 30 seconds
-        let accept_result = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await;
+        // Check for shutdown signal or accept with timeout
+        let accept_result = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("Shutdown signal received");
+                    let _ = roam_local::remove_endpoint(&endpoint);
+                    return Ok(());
+                }
+                continue;
+            }
+            result = tokio::time::timeout(Duration::from_secs(30), listener.accept()) => result,
+        };
 
         match accept_result {
-            Ok(Ok((stream, _addr))) => {
+            Ok(Ok(stream)) => {
                 // Update last activity
                 last_activity.store(start_time.elapsed().as_secs(), Ordering::Relaxed);
                 active_connections.fetch_add(1, Ordering::Relaxed);
@@ -342,24 +393,20 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                 );
 
                 let service = service.clone();
-                let hello = hello.clone();
+                let config = handshake_config.clone();
                 let active_connections = Arc::clone(&active_connections);
                 let last_activity = Arc::clone(&last_activity);
 
                 tokio::spawn(async move {
-                    // r[impl daemon.roam.framing]
-                    // Wrap in COBS framing (roam-stream is generic over any AsyncRead+AsyncWrite)
-                    let io = CobsFramed::new(stream);
-
                     // Create dispatcher (wraps service with generated dispatch + tracing)
                     let dispatcher = TraceyDaemonDispatcher::new(service);
 
-                    // Perform Hello exchange
-                    match hello_exchange_acceptor(io, hello).await {
-                        Ok(mut conn) => {
-                            info!("Hello exchange completed");
-                            // Run the message loop with the dispatcher
-                            if let Err(e) = conn.run(&dispatcher).await {
+                    // Accept connection with roam-stream (handles framing and hello exchange)
+                    match accept(stream, config, dispatcher).await {
+                        Ok((_handle, _incoming, driver)) => {
+                            info!("Connection established");
+                            // Run the driver (handles all RPC dispatch)
+                            if let Err(e) = driver.run().await {
                                 match e {
                                     ConnectionError::Closed => {
                                         info!("Connection closed cleanly");
@@ -377,7 +424,7 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            error!("Hello exchange failed: {:?}", e);
+                            error!("Connection setup failed: {:?}", e);
                         }
                     }
 
@@ -400,8 +447,8 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
 
                     if idle_secs >= DEFAULT_IDLE_TIMEOUT_SECS {
                         info!("No connections for {} seconds, shutting down", idle_secs);
-                        // Clean up socket
-                        let _ = std::fs::remove_file(&sock_path);
+                        // Clean up endpoint
+                        let _ = roam_local::remove_endpoint(&endpoint);
                         return Ok(());
                     }
                 }
@@ -432,10 +479,6 @@ fn build_gitignore(project_root: &Path) -> ignore::gitignore::Gitignore {
 }
 
 /// Run the smart file watcher, sending events to the channel.
-///
-/// r[impl daemon.watcher.smart-watch]
-/// r[impl server.watch.debounce]
-/// r[impl server.watch.config-file]
 ///
 /// This watcher only watches directories derived from config patterns,
 /// rather than the entire project root. It also handles reconfiguration
@@ -471,13 +514,11 @@ async fn run_smart_watcher(
         config_path_owned,
         Duration::from_millis(200),
         move |events| {
-            let paths: Vec<PathBuf> = match events {
-                Ok(events) => events.into_iter().map(|e| e.path).collect(),
-                Err(e) => {
-                    warn!("File watcher error: {:?}", e);
-                    vec![]
-                }
-            };
+            // Events are already batched; extract all paths from them
+            let paths: Vec<PathBuf> = events
+                .iter()
+                .flat_map(|e| e.paths.iter().cloned())
+                .collect();
 
             if paths.is_empty() {
                 return;
@@ -493,15 +534,19 @@ async fn run_smart_watcher(
                 .iter()
                 .any(|p| p == &config_path || p == &gitignore_path);
 
-            let event = if needs_reconfigure {
+            let watcher_event = if needs_reconfigure {
                 debug!("Config or gitignore changed, sending Reconfigure event");
                 WatcherEvent::Reconfigure
             } else {
-                debug!("File changes detected: {} files", paths.len());
-                WatcherEvent::FilesChanged(paths)
+                debug!(
+                    event_count = events.len(),
+                    path_count = paths.len(),
+                    "batched file changes"
+                );
+                WatcherEvent::FilesChanged(events)
             };
 
-            if tx_for_handler.blocking_send(event).is_err() {
+            if tx_for_handler.blocking_send(watcher_event).is_err() {
                 // Channel closed, watcher should stop
                 debug!("Watcher channel closed");
             }
@@ -545,16 +590,16 @@ async fn run_smart_watcher(
 /// Check if a daemon is running for the given workspace.
 #[allow(dead_code)]
 pub async fn is_running(project_root: &Path) -> bool {
-    let sock = socket_path(project_root);
-    if !sock.exists() {
+    let endpoint = local_endpoint(project_root);
+    if !roam_local::endpoint_exists(&endpoint) {
         return false;
     }
 
     // Try to connect
-    match tokio::net::UnixStream::connect(&sock).await {
+    match roam_local::connect(&endpoint).await {
         Ok(_) => true,
         Err(_) => {
-            // Socket exists but can't connect - stale
+            // Endpoint exists but can't connect - stale
             false
         }
     }
@@ -562,9 +607,20 @@ pub async fn is_running(project_root: &Path) -> bool {
 
 /// Connect to a running daemon, or return an error.
 #[allow(dead_code)]
-pub async fn connect(project_root: &Path) -> Result<tokio::net::UnixStream> {
-    let sock = socket_path(project_root);
-    tokio::net::UnixStream::connect(&sock)
+#[cfg(unix)]
+pub async fn connect(project_root: &Path) -> Result<roam_local::LocalStream> {
+    let endpoint = local_endpoint(project_root);
+    roam_local::connect(&endpoint)
         .await
-        .wrap_err_with(|| format!("Failed to connect to daemon at {}", sock.display()))
+        .wrap_err_with(|| format!("Failed to connect to daemon at {}", endpoint.display()))
+}
+
+/// Connect to a running daemon, or return an error.
+#[allow(dead_code)]
+#[cfg(windows)]
+pub async fn connect(project_root: &Path) -> Result<roam_local::LocalStream> {
+    let endpoint = local_endpoint(project_root);
+    roam_local::connect(&endpoint)
+        .await
+        .wrap_err_with(|| format!("Failed to connect to daemon at {}", endpoint))
 }

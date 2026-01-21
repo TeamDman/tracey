@@ -20,8 +20,8 @@ use tracey_core::{RefVerb, ReqDefinition, Reqs};
 
 // Markdown rendering
 use marq::{
-    AasvgHandler, ArboriumHandler, InlineCodeHandler, PikruHandler, RenderOptions, ReqHandler,
-    parse_frontmatter, render,
+    AasvgHandler, ArboriumHandler, CompareHandler, InlineCodeHandler, PikruHandler, RenderOptions,
+    ReqHandler, parse_frontmatter, render,
 };
 
 use crate::config::Config;
@@ -132,6 +132,7 @@ impl TraceyRuleHandler {
     }
 }
 
+/// @tracey:ignore-next-line
 /// Custom inline code handler that transforms `r[rule.id]` into clickable links.
 struct TraceyInlineCodeHandler {
     /// Spec name for URL generation
@@ -153,12 +154,15 @@ impl InlineCodeHandler for TraceyInlineCodeHandler {
     fn render(&self, code: &str) -> Option<String> {
         let code = code.trim();
 
+        // @tracey:ignore-next-line
         // Match r[rule.id] pattern
         if !code.starts_with("r[") || !code.ends_with(']') {
             return None;
         }
 
-        let rule_id = &code[2..code.len() - 1]; // Extract rule.id from r[rule.id]
+        // @tracey:ignore-next-line
+        // Extract rule.id from r[rule.id]
+        let rule_id = &code[2..code.len() - 1];
 
         // Validate it looks like a rule ID (alphanumeric, dots, dashes, underscores)
         if rule_id.is_empty()
@@ -255,7 +259,7 @@ impl ReqHandler for TraceyRuleHandler {
             let coverage = self.coverage.get(&rule.id);
             let status = coverage.map(|c| c.status).unwrap_or("uncovered");
 
-            // r[impl markdown.html.wbr] - insert <wbr> after dots for better line breaking
+            // Insert <wbr> after dots for better line breaking
             let display_id = rule.id.replace('.', ".<wbr>");
 
             // Get current source file for this rule (make it absolute)
@@ -761,7 +765,6 @@ pub async fn build_dashboard_data_with_overlay(
                 include.iter().partition(|p| !p.starts_with("../"));
 
             // Helper to process a file
-            // r[impl walk.extensions]
             let mut process_file = async |path: &Path, root: &Path, patterns: &[&String]| {
                 if path.extension().is_some_and(is_supported_extension) {
                     let relative = path.strip_prefix(root).unwrap_or(path);
@@ -954,9 +957,10 @@ async fn load_spec_content(
     let inline_code_handler =
         TraceyInlineCodeHandler::new(spec_name.to_string(), impl_name.to_string());
     let opts = RenderOptions::new()
-        .with_default_handler(ArboriumHandler::new())
+        .with_default_handler(ArboriumHandler::new().with_language_header(true))
         .with_handler(&["aasvg"], AasvgHandler::new())
         .with_handler(&["pikchr"], PikruHandler::new())
+        .with_handler(&["compare"], CompareHandler::new())
         .with_req_handler(rule_handler)
         .with_inline_code_handler(inline_code_handler);
 
@@ -1128,7 +1132,12 @@ fn build_outline(
 }
 
 /// Simple glob pattern matching
+///
+/// Normalizes path separators to forward slashes for cross-platform compatibility.
 pub fn glob_match(path: &str, pattern: &str) -> bool {
+    // Normalize Windows backslashes to forward slashes
+    let path = path.replace('\\', "/");
+
     if pattern == "**/*.rs" || pattern == "**/*.md" {
         let ext = pattern.rsplit('.').next().unwrap_or("");
         return path.ends_with(&format!(".{}", ext));

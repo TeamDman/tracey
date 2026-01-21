@@ -260,6 +260,39 @@ Each extracted requirement reference MUST include the byte length of the referen
 r[ref.span.file]
 Each extracted requirement reference MUST include the path to the source file.
 
+### Ignore Directives
+
+Tracey supports directives to suppress reference extraction in specific locations. This is useful for documentation, test assertions, or other contexts where requirement-like syntax appears but should not be treated as actual references.
+
+r[ref.ignore.prefix]
+Ignore directives MUST be prefixed with `@tracey:` to distinguish them from regular comments.
+
+> r[ref.ignore.next-line]
+> The `@tracey:ignore-next-line` directive MUST cause tracey to skip reference extraction on the immediately following line.
+>
+> ```rust
+> // @tracey:ignore-next-line
+> // This comment mentions r[impl auth.login] but it won't be extracted
+> fn example() {}
+> ```
+
+> r[ref.ignore.block]
+> The `@tracey:ignore-start` and `@tracey:ignore-end` directives MUST cause tracey to skip reference extraction for all lines between them (inclusive).
+>
+> ```rust
+> // @tracey:ignore-start
+> // The fixtures have both r[impl auth.login] and o[impl api.fetch]
+> // These are just documentation, not actual references
+> // @tracey:ignore-end
+> fn test_validation() {}
+> ```
+
+> r[ref.ignore.block-nesting]
+> Ignore blocks MUST NOT nest. A second `@tracey:ignore-start` before an `@tracey:ignore-end` SHOULD be treated as an error or ignored.
+
+> r[ref.ignore.block-unclosed]
+> An unclosed `@tracey:ignore-start` (no matching `@tracey:ignore-end` before end of file) SHOULD be treated as an error during validation.
+
 ---
 
 # Tooling
@@ -378,11 +411,11 @@ Requirement references in comments associated with a code unit MUST be extracted
 
 ## Configuration
 
-r[config.format.yaml]
-The configuration file MUST be in YAML format.
+r[config.format.styx]
+The configuration file MUST be in Styx format.
 
 r[config.path.default]
-The default configuration path MUST be `.config/tracey/config.yaml` relative to the project root.
+The default configuration path MUST be `.config/tracey/config.styx` relative to the project root.
 
 r[config.optional]
 The configuration file MUST be optional. The MCP server, HTTP server, and LSP MUST start correctly even when no configuration file exists, providing empty/default responses until a configuration is available.
@@ -393,67 +426,80 @@ When started without a configuration file, tracey MUST watch for the creation of
 > r[config.schema]
 > The configuration MUST follow this schema:
 >
-> ```kdl
-> spec {
->     name "tracey"
->     prefix "r"
->     include "docs/spec/**/*.md"
+> ```styx
+> specs (
+>   {
+>     name tracey
+>     prefix r
+>     include (docs/spec/**/*.md)
+>     impls (
+>       {
+>         name rust
+>         include (crates/**/*.rs)
+>         exclude (target/**)
+>       }
+>     )
+>   }
 >
->     impl {
->         name "rust"
->         include "crates/**/*.rs"
->         exclude "target/**"
->     }
-> }
->
-> spec {
->     name "messaging-protocol"
->     prefix "m"
->     include "vendor/messaging-spec/**/*.md"
->     source_url "https://github.com/example/messaging-spec"
->
->     impl {
->         name "rust"
->         include "crates/**/*.rs"
->     }
-> }
+>   {
+>     name messaging-protocol
+>     prefix m
+>     include (vendor/messaging-spec/**/*.md)
+>     source_url https://github.com/example/messaging-spec
+>     impls (
+>       {
+>         name rust
+>         include (crates/**/*.rs)
+>       }
+>     )
+>   }
+> )
 > ```
 
 r[config.spec.name]
-Each spec configuration MUST have a `name` child node with the spec name as its argument.
+Each spec configuration MUST have a `name` field with the spec name.
 
 r[config.spec.prefix]
-Each spec configuration MUST have a `prefix` child node specifying the single-character or multi-character prefix used to identify this spec in markdown and source code annotations.
+Each spec configuration MUST have a `prefix` field specifying the single-character or multi-character prefix used to identify this spec in markdown and source code annotations.
 
 r[config.spec.include]
-Each spec configuration MUST have one or more `include` child nodes specifying glob patterns for markdown files containing requirement definitions.
+Each spec configuration MUST have an `include` field with one or more glob patterns for markdown files containing requirement definitions.
 
 r[config.spec.source-url]
-Each spec configuration MAY have a `source_url` child node providing the canonical URL for the specification (e.g., a GitHub repository). This URL is used for attribution in the dashboard and documentation.
+Each spec configuration MAY have a `source_url` field providing the canonical URL for the specification (e.g., a GitHub repository). This URL is used for attribution in the dashboard and documentation.
 
 r[config.impl.name]
-Each impl configuration MUST have a `name` child node identifying the implementation (e.g., "main", "core").
+Each impl configuration MUST have a `name` field identifying the implementation (e.g., "main", "core").
 
 r[config.impl.include]
-Each impl configuration MAY have one or more `include` child nodes specifying glob patterns for source files to scan.
+Each impl configuration MAY have an `include` field with one or more glob patterns for source files to scan.
 
 r[config.impl.exclude]
-Each impl configuration MAY have one or more `exclude` child nodes specifying glob patterns for source files to exclude.
+Each impl configuration MAY have an `exclude` field with one or more glob patterns for source files to exclude.
 
 r[config.impl.test_include]
-Each impl configuration MAY have one or more `test_include` child nodes specifying glob patterns for test files to scan.
+Each impl configuration MAY have a `test_include` field with one or more glob patterns for test files to scan.
 
 r[config.impl.test_include.verify-only]
 Files matched by `test_include` patterns MUST only contain `verify` annotations. Any `impl` annotation in a test file is a hard error.
 
 Example configuration separating implementation and test files:
 
-```kdl
-impl {
-    name "rust"
-    include "src/**/*.rs"
-    test_include "tests/**/*.rs"
-}
+```styx
+specs (
+  {
+    name myapp
+    prefix r
+    include (docs/spec/**/*.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+        test_include (tests/**/*.rs)
+      }
+    )
+  }
+)
 ```
 
 In this example, `src/auth.rs` may contain `r[impl auth.token]` but `tests/auth_test.rs` may only contain `r[verify auth.token]`.
@@ -468,32 +514,36 @@ Requirement IDs MUST be unique within a single spec, but MAY be duplicated acros
 
 Example: implementing both your own spec and an external specification:
 
-```kdl
-// Your project's internal specification
-spec {
-    name "myapp"
-    prefix "r"
-    include "docs/spec/**/*.md"
+```styx
+specs (
+  // Your project's internal specification
+  {
+    name myapp
+    prefix r
+    include (docs/spec/**/*.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+        test_include (tests/**/*.rs)
+      }
+    )
+  }
 
-    impl {
-        name "rust"
-        include "src/**/*.rs"
-        test_include "tests/**/*.rs"
-    }
-}
-
-// External HTTP/2 specification (obtained via git submodule)
-spec {
-    name "http2"
-    prefix "h2"
-    source_url "https://github.com/http2/spec"
-    include "vendor/http2-spec/docs/**/*.md"
-
-    impl {
-        name "rust"
-        include "src/http2/**/*.rs"
-    }
-}
+  // External HTTP/2 specification (obtained via git submodule)
+  {
+    name http2
+    prefix h2
+    source_url https://github.com/http2/spec
+    include (vendor/http2-spec/docs/**/*.md)
+    impls (
+      {
+        name rust
+        include (src/http2/**/*.rs)
+      }
+    )
+  }
+)
 ```
 
 With this configuration:
@@ -711,10 +761,19 @@ Both `tracey serve` (HTTP) and `tracey mcp` (MCP) share a common headless server
 > r[server.watch.patterns-from-config]
 > The file watcher MUST derive which files to watch from the configuration's `include` patterns (both spec includes and impl includes), rather than hardcoding watched directories. For example, if the config contains:
 >
-> ```kdl
-> include "crates/**/*.rs"
-> include "crates/tracey/dashboard/src/**/*.tsx"
-> include "docs/spec/**/*.md"
+> ```styx
+> specs (
+>   {
+>     name tracey
+>     include (docs/spec/**/*.md)
+>     impls (
+>       {
+>         name rust
+>         include (crates/**/*.rs crates/tracey/dashboard/src/**/*.tsx)
+>       }
+>     )
+>   }
+> )
 > ```
 >
 > Then changes to `crates/foo/bar.rs`, `crates/tracey/dashboard/src/main.tsx`, and `docs/spec/tracey.md` should all trigger rebuilds.
@@ -726,7 +785,7 @@ r[server.watch.respect-excludes]
 The file watcher MUST respect `exclude` patterns from the configuration, not triggering rebuilds for files matching exclude patterns even if they match include patterns.
 
 r[server.watch.config-file]
-The file watcher MUST watch the configuration file itself (`.config/tracey/config.yaml`) for changes, triggering a rebuild when configuration changes.
+The file watcher MUST watch the configuration file itself (`.config/tracey/config.styx`) for changes, triggering a rebuild when configuration changes.
 
 r[server.watch.debounce]
 File change events MUST be debounced (default: 200ms) to avoid excessive recomputation during rapid edits.
@@ -829,6 +888,12 @@ The `tracey logs` command MUST display the daemon's log output from `.tracey/dae
 
 > r[daemon.cli.logs.lines]
 > The `--lines` flag MUST control how many historical lines to display (default: 50).
+
+r[daemon.cli.status]
+The `tracey status` command MUST display the daemon's current status, including uptime, watcher state, and any errors.
+
+r[daemon.cli.kill]
+The `tracey kill` command MUST send a shutdown signal to the running daemon and clean up any stale sockets.
 
 r[daemon.logs.file]
 The daemon MUST write all log output to `.tracey/daemon.log` in the workspace root.

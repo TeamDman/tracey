@@ -35,7 +35,7 @@ enum Command {
         root: Option<PathBuf>,
 
         /// Path to config file
-        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.yaml")]
+        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.styx")]
         config: PathBuf,
 
         /// Port to listen on (default: 3000)
@@ -58,7 +58,7 @@ enum Command {
         root: Option<PathBuf>,
 
         /// Path to config file
-        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.yaml")]
+        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.styx")]
         config: PathBuf,
     },
 
@@ -69,7 +69,7 @@ enum Command {
         root: Option<PathBuf>,
 
         /// Path to config file
-        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.yaml")]
+        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.styx")]
         config: PathBuf,
     },
 
@@ -80,7 +80,7 @@ enum Command {
         root: Option<PathBuf>,
 
         /// Path to config file
-        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.yaml")]
+        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.styx")]
         config: PathBuf,
     },
 
@@ -98,10 +98,33 @@ enum Command {
         #[facet(args::named, args::short = 'n', default)]
         lines: Option<usize>,
     },
+
+    /// Show daemon status
+    Status {
+        /// Project root directory (default: current directory)
+        #[facet(args::positional, default)]
+        root: Option<PathBuf>,
+    },
+
+    /// Stop the running daemon
+    Kill {
+        /// Project root directory (default: current directory)
+        #[facet(args::positional, default)]
+        root: Option<PathBuf>,
+    },
 }
 
+// Embed the config schema for zero-execution discovery by styx tooling
+styx_embed::embed_outdir_file!("schema.styx");
+
 fn main() -> Result<()> {
-    let args: Args = args::from_std_args().expect("failed to parse arguments");
+    let args: Args = match args::from_std_args() {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1)
+        }
+    };
 
     if args.version {
         println!("tracey {}", env!("CARGO_PKG_VERSION"));
@@ -118,7 +141,7 @@ fn main() -> Result<()> {
             open,
             dev,
         }) => {
-            init_tracing();
+            init_tracing(TracingConfig { log_file: None })?;
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(bridge::http::run(
                 root,
@@ -135,7 +158,6 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(bridge::mcp::run(root, config))
         }
-        // r[impl cli.lsp]
         // r[impl daemon.cli.lsp]
         Some(Command::Lsp { root, config }) => {
             // LSP communicates over stdio, so no tracing to stdout
@@ -144,46 +166,15 @@ fn main() -> Result<()> {
         }
         // r[impl daemon.cli.daemon]
         Some(Command::Daemon { root, config }) => {
-            use tracing_subscriber::layer::SubscriberExt;
-            use tracing_subscriber::util::SubscriberInitExt;
-
             let project_root = root.unwrap_or_else(|| find_project_root().unwrap_or_default());
             // r[impl config.path.default]
             let config_path = project_root.join(&config);
 
-            // Check for deprecated KDL config
-            check_kdl_deprecation(&project_root)?;
-
-            // Ensure .tracey directory exists for log file
-            let tracey_dir = project_root.join(".tracey");
-            std::fs::create_dir_all(&tracey_dir)?;
-
             // r[impl daemon.logs.file]
-            // Set up file logging
-            let log_path = tracey_dir.join("daemon.log");
-            let log_file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)?;
-
-            // Use RUST_LOG from environment, default to info if not set
-            // Crash on invalid RUST_LOG - don't silently fall back
-            let filter = match std::env::var("RUST_LOG") {
-                Ok(_) => tracing_subscriber::EnvFilter::from_default_env(),
-                Err(_) => tracing_subscriber::EnvFilter::new("tracey=info"),
-            };
-
-            // Create both console and file layers
-            let console_layer = tracing_subscriber::fmt::layer().with_ansi(true);
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(log_file);
-
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(console_layer)
-                .with(file_layer)
-                .init();
+            let log_path = project_root.join(".tracey/daemon.log");
+            init_tracing(TracingConfig {
+                log_file: Some(log_path),
+            })?;
 
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(daemon::run(project_root, config_path))
@@ -194,6 +185,16 @@ fn main() -> Result<()> {
             follow,
             lines,
         }) => show_logs(root, follow, lines.unwrap_or(50)),
+        // r[impl daemon.cli.status]
+        Some(Command::Status { root }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(show_status(root))
+        }
+        // r[impl daemon.cli.kill]
+        Some(Command::Kill { root }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(kill_daemon(root))
+        }
         // r[impl cli.no-args]
         None => {
             print_help();
@@ -215,6 +216,8 @@ fn print_help() {
     {lsp}       Start the LSP server for editor integration
     {daemon}    Start the tracey daemon (persistent server)
     {logs}      Show daemon logs
+    {status}    Show daemon status
+    {kill}      Stop the running daemon
 
 {options}:
     -h, --help      Show this help message
@@ -227,21 +230,62 @@ Run 'tracey <COMMAND> --help' for more information on a command."#,
         lsp = "lsp".cyan(),
         daemon = "daemon".cyan(),
         logs = "logs".cyan(),
+        status = "status".cyan(),
+        kill = "kill".cyan(),
         options = "Options".bold(),
     );
 }
 
-/// Initialize tracing for bridges (console output only).
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("tracey=info".parse().unwrap()),
-        )
-        .init();
+/// Configuration for tracing initialization.
+struct TracingConfig {
+    /// If Some, also log to this file (creating parent dirs as needed).
+    log_file: Option<PathBuf>,
 }
 
-/// r[impl cli.logs]
+/// Initialize tracing with optional file logging.
+fn init_tracing(config: TracingConfig) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // Use RUST_LOG from environment, default to info if not set
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(_) => tracing_subscriber::EnvFilter::from_default_env(),
+        Err(_) => tracing_subscriber::EnvFilter::new("tracey=info"),
+    };
+
+    let console_layer = tracing_subscriber::fmt::layer().with_ansi(true);
+
+    if let Some(log_path) = config.log_file {
+        // Ensure parent directory exists
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(log_file);
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(console_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(console_layer)
+            .init();
+    }
+
+    Ok(())
+}
+
+/// r[impl daemon.cli.logs]
 /// Show daemon logs from .tracey/daemon.log
 fn show_logs(root: Option<PathBuf>, follow: bool, lines: usize) -> Result<()> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -303,30 +347,168 @@ fn show_logs(root: Option<PathBuf>, follow: bool, lines: usize) -> Result<()> {
     Ok(())
 }
 
-/// Check for deprecated KDL config file and error if found
-fn check_kdl_deprecation(project_root: &std::path::Path) -> Result<()> {
-    let kdl_config = project_root.join(".config/tracey/config.kdl");
-    if kdl_config.exists() {
-        eyre::bail!(
-            "Found deprecated config file: {}\n\n\
-             Tracey now uses YAML configuration. Please:\n\
-             1. Rename {} to {}\n\
-             2. Convert the contents from KDL to YAML format\n\n\
-             Example YAML config:\n\
-             \n\
-             specs:\n\
-               - name: my-spec\n\
-                 prefix: r\n\
-                 include:\n\
-                   - \"docs/**/*.md\"\n\
-                 impls:\n\
-                   - name: rust\n\
-                     include:\n\
-                       - \"src/**/*.rs\"\n",
-            kdl_config.display(),
-            "config.kdl".red(),
-            "config.yaml".green(),
-        );
+/// r[impl daemon.cli.status]
+/// Show daemon status by connecting and calling health()
+async fn show_status(root: Option<PathBuf>) -> Result<()> {
+    let project_root = match root {
+        Some(r) => r,
+        None => find_project_root()?,
+    };
+
+    let endpoint = daemon::local_endpoint(&project_root);
+
+    // Check if endpoint exists
+    if !roam_local::endpoint_exists(&endpoint) {
+        println!("{}: No daemon running", "Status".yellow());
+        #[cfg(unix)]
+        println!("  Socket: {} (not found)", endpoint.display());
+        #[cfg(windows)]
+        println!("  Endpoint: {} (not found)", endpoint);
+        return Ok(());
     }
+
+    // Try to connect without auto-starting
+    match roam_local::connect(&endpoint).await {
+        Ok(stream) => {
+            // Create a minimal client to call health()
+            use roam_stream::{Connector, HandshakeConfig, NoDispatcher, connect};
+
+            struct DirectConnector {
+                stream: std::sync::Mutex<Option<roam_local::LocalStream>>,
+            }
+
+            impl Connector for DirectConnector {
+                type Transport = roam_local::LocalStream;
+                async fn connect(&self) -> std::io::Result<Self::Transport> {
+                    self.stream
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("already connected"))
+                }
+            }
+
+            let connector = DirectConnector {
+                stream: std::sync::Mutex::new(Some(stream)),
+            };
+            let client = connect(connector, HandshakeConfig::default(), NoDispatcher);
+            let client = tracey_proto::TraceyDaemonClient::new(client);
+
+            match client.health().await {
+                Ok(health) => {
+                    println!("{}: Daemon is running", "Status".green());
+                    println!("  Uptime: {}s", health.uptime_secs);
+                    println!("  Data version: {}", health.version);
+                    println!(
+                        "  Watcher: {}",
+                        if health.watcher_active {
+                            "active".green().to_string()
+                        } else {
+                            "inactive".yellow().to_string()
+                        }
+                    );
+                    if let Some(err) = &health.watcher_error {
+                        println!("  Watcher error: {}", err.as_str().red());
+                    }
+                    if let Some(err) = &health.config_error {
+                        println!("  Config error: {}", err.as_str().red());
+                    }
+                    println!("  File events: {}", health.watcher_event_count);
+                    println!("  Watched dirs: {}", health.watched_directories.len());
+                }
+                Err(e) => {
+                    println!("{}: Daemon connection failed", "Status".red());
+                    println!("  Error: {}", e);
+                }
+            }
+        }
+        Err(_) => {
+            println!("{}: Daemon not responding", "Status".yellow());
+            #[cfg(unix)]
+            println!(
+                "  Socket exists at {} but cannot connect",
+                endpoint.display()
+            );
+            #[cfg(windows)]
+            println!("  Endpoint exists but cannot connect");
+            println!("  The daemon may have crashed. Run 'tracey kill' to clean up.");
+        }
+    }
+
+    Ok(())
+}
+
+/// r[impl daemon.cli.kill]
+/// Kill the running daemon by sending a shutdown request
+async fn kill_daemon(root: Option<PathBuf>) -> Result<()> {
+    let project_root = match root {
+        Some(r) => r,
+        None => find_project_root()?,
+    };
+
+    let endpoint = daemon::local_endpoint(&project_root);
+
+    // Check if endpoint exists
+    if !roam_local::endpoint_exists(&endpoint) {
+        println!("{}: No daemon running", "Info".cyan());
+        return Ok(());
+    }
+
+    // Try to connect and send shutdown
+    match roam_local::connect(&endpoint).await {
+        Ok(stream) => {
+            use roam_stream::{Connector, HandshakeConfig, NoDispatcher, connect};
+
+            struct DirectConnector {
+                stream: std::sync::Mutex<Option<roam_local::LocalStream>>,
+            }
+
+            impl Connector for DirectConnector {
+                type Transport = roam_local::LocalStream;
+                async fn connect(&self) -> std::io::Result<Self::Transport> {
+                    self.stream
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("already connected"))
+                }
+            }
+
+            let connector = DirectConnector {
+                stream: std::sync::Mutex::new(Some(stream)),
+            };
+            let client = connect(connector, HandshakeConfig::default(), NoDispatcher);
+            let client = tracey_proto::TraceyDaemonClient::new(client);
+
+            match client.shutdown().await {
+                Ok(()) => {
+                    println!("{}: Shutdown signal sent", "Success".green());
+                }
+                Err(e) => {
+                    // Connection may close before we get a response, that's OK
+                    let err_str = e.to_string();
+                    if err_str.contains("closed") {
+                        println!("{}: Daemon stopped", "Success".green());
+                    } else {
+                        println!(
+                            "{}: Error sending shutdown: {}",
+                            "Warning".yellow(),
+                            err_str
+                        );
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            // Socket exists but can't connect - clean it up
+            println!(
+                "{}: Daemon not responding, cleaning up stale socket",
+                "Info".cyan()
+            );
+            let _ = roam_local::remove_endpoint(&endpoint);
+            println!("{}: Cleaned up", "Success".green());
+        }
+    }
+
     Ok(())
 }
