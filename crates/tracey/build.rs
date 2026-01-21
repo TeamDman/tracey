@@ -82,8 +82,13 @@ fn build_dashboard() {
 
     eprintln!("Building dashboard with pnpm...");
 
+    #[cfg(windows)]
+    let pnpm_exe = "pnpm.cmd";
+    #[cfg(not(windows))]
+    let pnpm_exe = "pnpm";
+
     // Install dependencies if needed
-    let status = Command::new("pnpm")
+    let status = Command::new(pnpm_exe)
         .args(["install", "--frozen-lockfile"])
         .current_dir(dashboard_dir)
         .status()
@@ -94,7 +99,7 @@ fn build_dashboard() {
     }
 
     // Build the dashboard
-    let status = Command::new("pnpm")
+    let status = Command::new(pnpm_exe)
         .args(["run", "build"])
         .current_dir(dashboard_dir)
         .status()
