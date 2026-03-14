@@ -320,6 +320,12 @@ fn devicon_class(path: &str) -> Option<&'static str> {
     }
 }
 
+fn display_file_label(path: &str) -> &str {
+    path.rfind(|ch| ['/', '\\'].contains(&ch))
+        .map(|index| &path[index + 1..])
+        .unwrap_or(path)
+}
+
 // r[impl markdown.html.div] - rule wrapped in <div class="rule-container">
 // r[impl markdown.html.anchor] - div has id="r-{rule.id}"
 // r[impl markdown.html.link] - rule-badge links to the rule
@@ -357,7 +363,7 @@ impl ReqHandler for TraceyRuleHandler {
             if let Some(cov) = coverage {
                 if !cov.impl_refs.is_empty() {
                     let r = &cov.impl_refs[0];
-                    let filename = r.file.rsplit('/').next().unwrap_or(&r.file);
+                    let filename = display_file_label(&r.file);
                     let icon = devicon_class(&r.file)
                         .map(|c| format!(r#"<i class="{c}"></i> "#))
                         .unwrap_or_default();
@@ -390,7 +396,7 @@ impl ReqHandler for TraceyRuleHandler {
                 // r[impl dashboard.links.verify-refs]
                 if !cov.verify_refs.is_empty() {
                     let r = &cov.verify_refs[0];
-                    let filename = r.file.rsplit('/').next().unwrap_or(&r.file);
+                    let filename = display_file_label(&r.file);
                     let icon = devicon_class(&r.file)
                         .map(|c| format!(r#"<i class="{c}"></i> "#))
                         .unwrap_or_default();
@@ -434,8 +440,10 @@ impl ReqHandler for TraceyRuleHandler {
             // Render the opening of the req container
             Ok(format!(
                 r#"<div class="req-container req-{status}" id="{anchor}" data-br="{br_start}-{br_end}">
+<div class="req-header">
 <div class="req-badges-left">{badges}</div>
 <div class="req-badges-right">{edit_badge}</div>
+</div>
 <div class="req-content">"#,
                 status = status,
                 anchor = rule.anchor_id,

@@ -586,7 +586,7 @@ function showRefsPopup(
 
   const items = refs
     .map((ref) => {
-      const filename = ref.file.split("/").pop();
+      const filename = splitPath(ref.file).name;
       return `<div class="refs-popup-item" data-file="${ref.file}" data-line="${ref.line}">
         <span class="refs-popup-file">${filename}:${ref.line}</span>
       </div>`;

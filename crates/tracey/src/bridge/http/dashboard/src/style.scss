@@ -1801,17 +1801,6 @@
         --req-badge-color: var(--status-uncovered-fg);
         --req-badge-weight: 700;
 
-        &::before {
-            content: "";
-            position: absolute;
-            inset-inline-start: 0;
-            top: 1.75rem;
-            bottom: 1.25rem;
-            width: 3px;
-            background: var(--neutral);
-            border-radius: 0 2px 2px 0;
-        }
-
         & + & {
             margin-top: var(--space-6);
         }
@@ -1826,11 +1815,6 @@
             &:hover {
                 opacity: 0.8;
             }
-
-            &::before {
-                background: var(--green);
-                opacity: 0.5;
-            }
         }
 
         &.req-partial {
@@ -1838,19 +1822,11 @@
             --req-badge-bg: var(--status-partial-bg);
             --req-badge-color: var(--status-partial-fg);
             --req-badge-weight: 500;
-
-            &::before {
-                background: var(--yellow);
-            }
         }
 
         &.req-uncovered {
             border: 2px dashed var(--accent);
             background: var(--accent-5);
-
-            &::before {
-                display: none;
-            }
         }
 
         &.req-focused {
@@ -1864,23 +1840,36 @@
         }
     }
 
+    .req-header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: var(--space-2) var(--space-3);
+        margin: calc(-1 * (var(--space-3) + var(--space-0-5))) calc(-1 * var(--space-1)) 0;
+        padding: 0 var(--space-1);
+        position: relative;
+        z-index: 1;
+    }
+
     .req-badges-left,
     .req-badges-right {
-        position: absolute;
-        top: -0.7rem;
         display: flex;
-        align-items: center;
+        align-items: flex-start;
+        flex-wrap: wrap;
         gap: var(--space-1);
         background: var(--bg);
         padding: 0 var(--space-1);
+        min-width: 0;
     }
 
     .req-badges-left {
-        inset-inline-start: var(--space-3);
+        flex: 1 1 18rem;
     }
 
     .req-badges-right {
-        inset-inline-end: var(--space-4);
+        flex: 0 0 auto;
+        justify-content: flex-end;
     }
 
     .req-badge {
@@ -1895,15 +1884,20 @@
         font-variation-settings:
             "MONO" 1,
             "CASL" 0;
+        min-width: 0;
+        max-width: 100%;
+        line-height: var(--leading-snug);
 
         &:hover {
             filter: brightness(1.15);
         }
 
         &.req-id {
+            display: inline-flex;
             background: var(--req-badge-bg);
             color: var(--req-badge-color);
             font-weight: var(--req-badge-weight);
+            overflow-wrap: anywhere;
         }
 
         &.req-impl {
@@ -1914,12 +1908,14 @@
             flex-direction: row;
             align-items: center;
             gap: var(--space-1);
+            overflow-wrap: anywhere;
         }
 
         &.req-test {
             background: var(--ref-verify-bg);
             color: var(--ref-verify-color);
             border: 1px solid var(--ref-verify-border);
+            overflow-wrap: anywhere;
         }
 
         &.req-edit {
@@ -1931,6 +1927,7 @@
             align-items: center;
             gap: var(--space-1);
             transition: all 0.15s;
+            white-space: nowrap;
 
             &:hover {
                 background: var(--accent-12);
@@ -1969,19 +1966,36 @@
 
     .req-badge-group {
         display: inline-flex;
-        gap: var(--space-1);
+        gap: 0;
+        min-width: 0;
+        max-width: 100%;
     }
 
     .req-segment-left {
         border-radius: 4px 0 0 4px;
+        flex: 0 0 auto;
     }
 
     .req-segment-right {
         border-radius: 0 4px 4px 0;
+        min-width: 0;
     }
 
     .req-content {
-        margin-top: var(--space-1);
+        margin-top: var(--space-3);
+        min-width: 0;
+        position: relative;
+
+        &::before {
+            content: "";
+            position: absolute;
+            inset-inline-start: calc(-1 * var(--space-5));
+            top: var(--space-1);
+            bottom: var(--space-1);
+            width: 3px;
+            background: var(--neutral);
+            border-radius: 0 2px 2px 0;
+        }
 
         & p {
             margin: var(--space-2) 0;
@@ -1994,6 +2008,19 @@
         & :is(ol, ul) {
             margin: var(--space-3) 0;
             padding-inline-start: var(--space-6);
+        }
+
+        .req-covered &::before {
+            background: var(--green);
+            opacity: 0.5;
+        }
+
+        .req-partial &::before {
+            background: var(--yellow);
+        }
+
+        .req-uncovered &::before {
+            display: none;
         }
 
         & li {
@@ -2270,11 +2297,12 @@
    ========================================================================== */
 
     .ref-line {
-        white-space: nowrap;
+        white-space: normal;
         margin-bottom: var(--space-1-5);
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: var(--space-1-5);
+        min-width: 0;
 
         &:last-child {
             margin-bottom: 0;
@@ -2302,10 +2330,12 @@
     .file-path-link,
     .file-path-display {
         display: inline-flex;
-        align-items: center;
+        align-items: flex-start;
         gap: var(--space-1-5);
         text-decoration: none;
         font-size: 0.95em;
+        min-width: 0;
+        max-width: 100%;
     }
 
     .file-path-link:hover .file-path-name {
@@ -2320,16 +2350,32 @@
     }
 
     .file-path-text {
-        display: inline;
+        display: inline-flex;
+        flex-wrap: wrap;
+        min-width: 0;
+        line-height: var(--leading-snug);
     }
     .file-path-dir {
         color: var(--fg-dim);
+        overflow-wrap: anywhere;
     }
     .file-path-name {
         color: var(--accent);
+        overflow-wrap: anywhere;
     }
     .file-path-line {
         color: var(--green);
+    }
+
+    @media (max-width: 960px) {
+        .req-header {
+            flex-direction: column;
+            align-items: stretch;
+        }
+
+        .req-badges-right {
+            justify-content: flex-start;
+        }
     }
 
     /* Legacy file-link (backwards compat) */

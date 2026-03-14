@@ -201,7 +201,7 @@ export function splitHighlightedHtml(html: string) {
 
 // Helper to split file path into dir and filename
 export function splitPath(filePath: string) {
-	const lastSlash = filePath.lastIndexOf("/");
+	const lastSlash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
 	if (lastSlash === -1) return { dir: "", name: filePath };
 	return {
 		dir: filePath.slice(0, lastSlash + 1),
