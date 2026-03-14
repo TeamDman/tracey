@@ -393,11 +393,6 @@ fn build_dashboard() {
 
     eprintln!("Building dashboard with pnpm...");
 
-    #[cfg(windows)]
-    let pnpm_exe = "pnpm.cmd";
-    #[cfg(not(windows))]
-    let pnpm_exe = "pnpm";
-
     // Install dependencies if needed
     let status = shell_command("pnpm")
         .args(["install", "--frozen-lockfile"])
