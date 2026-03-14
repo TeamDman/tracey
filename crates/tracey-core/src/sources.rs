@@ -3,7 +3,9 @@
 use crate::lexer::{Reqs, extract_from_content};
 use eyre::Result;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "walk")]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// r[impl ref.cross-workspace.missing-paths]
 /// Result of extracting requirements, including any warnings about missing files
@@ -14,7 +16,6 @@ pub struct ExtractionResult {
 }
 
 /// File extensions that tracey knows how to scan for requirement references.
-/// These all use `//` and `/* */` comment syntax.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "rs",     // Rust
     "swift",  // Swift
@@ -39,6 +40,47 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "cs",     // C#
     "zig",    // Zig
     "php",    // PHP
+    "py",     // Python
+    "rb",     // Ruby
+    "r",      // R
+    "R",      // R (uppercase)
+    "dart",   // Dart
+    "lua",    // Lua
+    "asm",    // Assembly
+    "s",      // Assembly
+    "S",      // Assembly (uppercase)
+    "pl",     // Perl
+    "pm",     // Perl module
+    "hs",     // Haskell
+    "lhs",    // Literate Haskell
+    "ex",     // Elixir
+    "exs",    // Elixir script
+    "erl",    // Erlang
+    "hrl",    // Erlang header
+    "clj",    // Clojure
+    "cljs",   // ClojureScript
+    "cljc",   // Clojure common
+    "edn",    // EDN
+    "fs",     // F#
+    "fsi",    // F# script
+    "fsx",    // F# script
+    "vb",     // Visual Basic
+    "vbs",    // VBScript
+    "cob",    // COBOL
+    "cbl",    // COBOL
+    "cpy",    // COBOL copybook
+    "jl",     // Julia
+    "d",      // D
+    "ps1",    // PowerShell
+    "psm1",   // PowerShell module
+    "psd1",   // PowerShell data
+    "cmake",  // CMake
+    "ml",     // OCaml
+    "mli",    // OCaml interface
+    "sh",     // Shell/Bash
+    "bash",   // Bash
+    "zsh",    // Zsh
+    "nix",    // Nix
 ];
 
 /// Check if a file extension is supported for scanning
@@ -292,11 +334,11 @@ fn is_included(path: &Path, root: &Path, patterns: &[String]) -> bool {
     }
 
     let relative = path.strip_prefix(root).unwrap_or(path);
-    let relative_str = relative.to_string_lossy().replace('\\', "/");
 
     for pattern in patterns {
-        let pattern = pattern.replace('\\', "/");
-        if matches_glob(&relative_str, &pattern) {
+        if let Ok(glob) = globset::Glob::new(pattern)
+            && glob.compile_matcher().is_match(relative)
+        {
             return true;
         }
     }
@@ -307,75 +349,16 @@ fn is_included(path: &Path, root: &Path, patterns: &[String]) -> bool {
 #[cfg(feature = "walk")]
 fn is_excluded(path: &Path, root: &Path, patterns: &[String]) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    let relative_str = relative.to_string_lossy().replace('\\', "/");
 
     for pattern in patterns {
-        let pattern = pattern.replace('\\', "/");
-        if matches_glob(&relative_str, &pattern) {
+        if let Ok(glob) = globset::Glob::new(pattern)
+            && glob.compile_matcher().is_match(relative)
+        {
             return true;
         }
     }
 
     false
-}
-
-#[cfg(feature = "walk")]
-fn matches_glob(path: &str, pattern: &str) -> bool {
-    assert!(!path.contains('\\'));
-    assert!(!pattern.contains('\\'));
-
-    // Handle **/*.ext patterns (e.g., **/*.rs, **/*.swift, **/*.ts)
-    if let Some(ext) = pattern.strip_prefix("**/*.") {
-        return path.ends_with(&format!(".{}", ext));
-    }
-
-    // Handle prefix/**/*.ext patterns (e.g., src/**/*.rs, Sources/**/*.swift)
-    if let Some(rest) = pattern.strip_prefix("**/") {
-        // Pattern like "**/foo/*.rs" - just check the suffix part
-        return matches_glob(path, rest);
-    }
-
-    // Handle prefix/** patterns (e.g., target/**)
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path.starts_with(prefix) || path.starts_with(&format!("{}/", prefix));
-    }
-
-    // Handle prefix/**/*.ext patterns (e.g., src/**/*.rs)
-    if let Some((prefix, suffix)) = pattern.split_once("/**/") {
-        if !path.starts_with(prefix) && !path.starts_with(&format!("{}/", prefix)) {
-            return false;
-        }
-        let after_prefix = path.strip_prefix(prefix).unwrap_or(path);
-        let after_prefix = after_prefix.strip_prefix('/').unwrap_or(after_prefix);
-        return matches_glob(after_prefix, suffix);
-    }
-
-    // Handle *.ext patterns (e.g., *.rs)
-    if let Some(ext) = pattern.strip_prefix("*.") {
-        return path.ends_with(&format!(".{}", ext));
-    }
-
-    // Handle exact matches
-    if !pattern.contains('*') {
-        return path == pattern;
-    }
-
-    // Fallback: simple contains check for the non-wildcard parts
-    let parts: Vec<&str> = pattern.split('*').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() {
-        return true;
-    }
-
-    let mut remaining = path;
-    for part in parts {
-        if let Some(idx) = remaining.find(part) {
-            remaining = &remaining[idx + part.len()..];
-        } else {
-            return false;
-        }
-    }
-
-    true
 }
 
 /// r[impl ref.cross-workspace.path-resolution]
@@ -490,6 +473,31 @@ mod tests {
         assert!(result.warnings.is_empty());
     }
 
+    // r[verify config.impl.test_include.extraction]
+    #[cfg(feature = "reverse")]
+    #[test]
+    fn test_memory_sources_python() {
+        let result = Reqs::extract(
+            MemorySources::new()
+                .add("test_auth.py", "# r[verify auth.login]")
+                .add(
+                    "test_session.py",
+                    "# r[verify session.create]\n# r[verify session.expire]",
+                ),
+        )
+        .unwrap();
+
+        assert_eq!(result.reqs.len(), 3);
+        assert_eq!(result.reqs.references[0].req_id, "auth.login");
+        assert_eq!(
+            result.reqs.references[0].verb,
+            crate::lexer::RefVerb::Verify
+        );
+        assert_eq!(result.reqs.references[1].req_id, "session.create");
+        assert_eq!(result.reqs.references[2].req_id, "session.expire");
+        assert!(result.warnings.is_empty());
+    }
+
     #[test]
     fn test_memory_sources_mixed_languages() {
         let result = Reqs::extract(
@@ -503,6 +511,22 @@ mod tests {
         assert_eq!(result.reqs.len(), 3);
     }
 
+    #[cfg(feature = "reverse")]
+    #[test]
+    fn test_memory_sources_nix() {
+        let result = Reqs::extract(
+            MemorySources::new()
+                .add("default.nix", "# r[impl nix.req.one]")
+                .add("flake.nix", "/* r[verify nix.req.two] */\n{ }"),
+        )
+        .unwrap();
+
+        assert_eq!(result.reqs.len(), 2);
+        assert_eq!(result.reqs.references[0].req_id, "nix.req.one");
+        assert_eq!(result.reqs.references[1].req_id, "nix.req.two");
+        assert!(result.warnings.is_empty());
+    }
+
     #[test]
     fn test_supported_extensions() {
         use std::ffi::OsStr;
@@ -514,6 +538,7 @@ mod tests {
         assert!(is_supported_extension(OsStr::new("js")));
         assert!(is_supported_extension(OsStr::new("go")));
         assert!(is_supported_extension(OsStr::new("php")));
+        assert!(is_supported_extension(OsStr::new("nix")));
 
         assert!(!is_supported_extension(OsStr::new("md")));
         assert!(!is_supported_extension(OsStr::new("txt")));
@@ -522,59 +547,63 @@ mod tests {
 
     #[cfg(feature = "walk")]
     mod glob_tests {
-        use super::super::matches_glob;
+        fn matches(path: &str, pattern: &str) -> bool {
+            globset::Glob::new(pattern)
+                .unwrap()
+                .compile_matcher()
+                .is_match(std::path::Path::new(path))
+        }
 
         #[test]
         fn test_matches_glob_star_star_ext() {
-            assert!(matches_glob("foo.rs", "**/*.rs"));
-            assert!(matches_glob("src/foo.rs", "**/*.rs"));
-            assert!(matches_glob("src/bar/baz.rs", "**/*.rs"));
-            assert!(!matches_glob("foo.swift", "**/*.rs"));
+            assert!(matches("foo.rs", "**/*.rs"));
+            assert!(matches("src/foo.rs", "**/*.rs"));
+            assert!(matches("src/bar/baz.rs", "**/*.rs"));
+            assert!(!matches("foo.swift", "**/*.rs"));
 
-            assert!(matches_glob("App.swift", "**/*.swift"));
-            assert!(matches_glob("Sources/App.swift", "**/*.swift"));
-            assert!(!matches_glob("App.rs", "**/*.swift"));
+            assert!(matches("App.swift", "**/*.swift"));
+            assert!(matches("Sources/App.swift", "**/*.swift"));
+            assert!(!matches("App.rs", "**/*.swift"));
 
-            assert!(matches_glob("index.ts", "**/*.ts"));
-            assert!(matches_glob("src/components/Button.tsx", "**/*.tsx"));
+            assert!(matches("index.ts", "**/*.ts"));
+            assert!(matches("src/components/Button.tsx", "**/*.tsx"));
         }
 
         #[test]
         fn test_matches_glob_prefix_star_star() {
-            assert!(matches_glob("target/debug/foo", "target/**"));
-            assert!(matches_glob("target/release/bar", "target/**"));
-            assert!(!matches_glob("src/main.rs", "target/**"));
+            assert!(matches("target/debug/foo", "target/**"));
+            assert!(matches("target/release/bar", "target/**"));
+            assert!(!matches("src/main.rs", "target/**"));
         }
 
         #[test]
         fn test_matches_glob_prefix_star_star_ext() {
-            assert!(matches_glob("src/main.rs", "src/**/*.rs"));
-            assert!(matches_glob("src/foo/bar.rs", "src/**/*.rs"));
-            assert!(!matches_glob("tests/main.rs", "src/**/*.rs"));
-            assert!(!matches_glob("src/main.swift", "src/**/*.rs"));
+            assert!(matches("src/main.rs", "src/**/*.rs"));
+            assert!(matches("src/foo/bar.rs", "src/**/*.rs"));
+            assert!(!matches("tests/main.rs", "src/**/*.rs"));
+            assert!(!matches("src/main.swift", "src/**/*.rs"));
 
-            assert!(matches_glob("Sources/App.swift", "Sources/**/*.swift"));
-            assert!(!matches_glob("Tests/AppTests.swift", "Sources/**/*.swift"));
+            assert!(matches("Sources/App.swift", "Sources/**/*.swift"));
+            assert!(!matches("Tests/AppTests.swift", "Sources/**/*.swift"));
         }
 
         #[test]
         fn test_matches_glob_exact() {
-            assert!(matches_glob("foo.rs", "foo.rs"));
-            assert!(!matches_glob("bar.rs", "foo.rs"));
+            assert!(matches("foo.rs", "foo.rs"));
+            assert!(!matches("bar.rs", "foo.rs"));
         }
 
         #[test]
         fn test_matches_glob_dashboard_tsx() {
-            // Test the specific dashboard pattern that wasn't working
-            assert!(matches_glob(
+            assert!(matches(
                 "crates/tracey/dashboard/src/main.tsx",
                 "crates/tracey/dashboard/src/**/*.tsx"
             ));
-            assert!(matches_glob(
+            assert!(matches(
                 "crates/tracey/dashboard/src/router.ts",
                 "crates/tracey/dashboard/src/**/*.ts"
             ));
-            assert!(matches_glob(
+            assert!(matches(
                 "crates/tracey/dashboard/src/views/spec.tsx",
                 "crates/tracey/dashboard/src/**/*.tsx"
             ));
@@ -598,7 +627,7 @@ mod tests {
                 return;
             }
 
-            // Create WalkSources with the same patterns as config.yaml
+            // Create WalkSources with the same patterns as config.styx
             let result = Reqs::extract(
                 WalkSources::new(project_root)
                     .include([

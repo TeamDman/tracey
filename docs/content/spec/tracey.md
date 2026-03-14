@@ -1,4 +1,6 @@
-# Tracey Specification
++++
+title = "Tracey Specification"
++++
 
 ## Introduction
 
@@ -41,12 +43,12 @@ This section specifies the annotation language: how to define requirements in ma
 
 ## Requirement Definitions in Markdown
 
-Requirements are defined in markdown specification documents using the syntax `PREFIX[REQ]` where PREFIX is the spec's configured prefix and REQ is a requirement ID.
+Requirements are defined in markdown specification documents using the syntax `PREFIX[REQ]` where PREFIX is the marker written in the spec file and REQ is a requirement ID.
 
 ### Markdown Requirement Syntax
 
-> r[markdown.syntax.marker]
-> A requirement definition MUST be written as `PREFIX[REQ]` in one of two contexts: as a standalone paragraph starting at column 0, or inside a blockquote. The PREFIX identifies which spec this requirement belongs to (configured via `prefix` in the spec configuration). The VERB is implicitly "define" in markdown (unlike source code which uses explicit verbs like `r[impl REQ]`).
+> r[markdown.syntax.marker+2]
+> A requirement definition MUST be written as `PREFIX[REQ]` in one of two contexts: as a standalone paragraph starting at column 0, or inside a blockquote. The PREFIX MAY be any lowercase alphanumeric marker (for example `r`, `req`, or `h2`) and is inferred directly from the markdown marker itself. The VERB is implicitly "define" in markdown (unlike source code which uses explicit verbs like `r[impl REQ]`).
 >
 > Valid (standalone):
 > ```markdown
@@ -121,20 +123,20 @@ Requirements are defined in markdown specification documents using the syntax `P
 
 ## Requirement References in Source Code
 
-Requirement references are extracted from source code comments using the syntax `PREFIX[VERB REQ]` where PREFIX matches a configured spec's prefix.
+Requirement references are extracted from source code comments using the syntax `PREFIX[VERB REQ]` where PREFIX matches a spec marker inferred from requirement definitions.
 
 ### Basic Syntax
 
-r[ref.syntax.brackets]
-A requirement reference MUST be written as `PREFIX[VERB REQ]` within a comment, where PREFIX identifies which spec is being referenced (matching the `prefix` field in the spec configuration).
+r[ref.syntax.brackets+2]
+A requirement reference MUST be written as `PREFIX[VERB REQ]` within a comment, where PREFIX identifies which spec is being referenced (matching a marker prefix inferred from spec requirement definitions).
 
 > r[ref.syntax.verb]
 > VERB indicates the relationship type (impl, verify, depends, related).
 > 
 > If omitted, defaults to `impl`.
 
-> r[ref.syntax.req-id]
-> REQ is a requirement ID consisting of dot-separated segments.
+> r[ref.syntax.req-id+3]
+> REQ is a requirement ID consisting of one or more segments separated by dots, optionally followed by a version suffix.
 >
 > Each segment MUST contain only ASCII letters (a-z, A-Z), digits (0-9), hyphens, or underscores. This restriction ensures requirement IDs work cleanly in URLs without encoding issues.
 
@@ -161,6 +163,27 @@ A requirement reference MUST be written as `PREFIX[VERB REQ]` within a comment, 
 > // r[impl auth.🔐.token]         // emoji not allowed
 > // r[verify café.menu]           // accented characters not allowed
 > ```
+
+> r[ref.syntax.version]
+> A requirement ID MAY carry a version suffix of the form `+N`, where N is a positive integer (≥ 1).
+>
+> The `+` character separates the base ID from the version number. Only a single `+` is allowed.
+> Version 0 is invalid. A trailing `+` with no number is invalid.
+>
+> Examples:
+> - `auth.login` — base ID, implicitly version 1
+> - `auth.login+2` — base ID at version 2
+> - `display.edge.fields+10` — base ID at version 10
+>
+> Invalid:
+> - `auth.login+` — trailing `+` with no number
+> - `auth.login+0` — version 0 is not allowed
+> - `auth.login+1+2` — multiple `+` not allowed
+
+> r[ref.syntax.version.implicit]
+> A reference without a version suffix MUST be treated as implicitly referencing version 1.
+>
+> That is, `r[impl auth.login]` is equivalent to `r[impl auth.login+1]`.
 
 ### Supported Verbs
 
@@ -304,8 +327,16 @@ This section specifies how the tracey tool processes annotations, computes cover
 r[coverage.compute.percentage]
 Coverage percentage MUST be calculated as (covered requirements / total requirements) * 100.
 
-r[coverage.compute.covered]
-Tracey MUST consider a requirement covered if at least one reference to it exists in the scanned source files.
+r[coverage.compute.covered+2]
+Tracey MUST consider a requirement covered if at least one reference to it exists in the scanned source files **at the current version** (i.e., the reference version matches the spec rule version).
+
+r[coverage.compute.stale]
+When a requirement carries a version suffix `+N` and an implementation reference exists for the same base ID but at an older version (< N), Tracey MUST report the requirement as **stale** rather than covered.
+
+A stale requirement means the code was written against an earlier version of the rule and must be reviewed and updated before it counts as covered.
+
+r[coverage.compute.stale.update]
+To resolve a stale reference, the developer MUST update the annotation in source code to include the current version suffix (e.g., change `r[impl auth.login]` to `r[impl auth.login+2]`), confirming they have reviewed the code against the updated rule.
 
 r[coverage.compute.uncovered]
 Requirements in the manifest with no references MUST be reported as uncovered.
@@ -318,17 +349,17 @@ References to requirement IDs not present in the manifest MUST be reported as in
 r[ref.verb.unknown]
 When an unrecognized verb is encountered, tracey MUST emit a warning but SHOULD still extract the requirement reference.
 
-r[ref.prefix.unknown]
-When a reference uses a prefix that does not match any configured spec, tracey MUST report an error indicating the unknown prefix and list the available spec prefixes.
+r[ref.prefix.unknown+2]
+When a reference uses a prefix that does not match any inferred spec marker prefix, tracey MUST report an error indicating the unknown prefix and list the available marker prefixes.
 
-r[ref.prefix.matching]
-When extracting references from source code, tracey MUST match the prefix against configured specs to determine which spec's requirement namespace to query.
+r[ref.prefix.matching+2]
+When extracting references from source code, tracey MUST match the reference prefix against marker prefixes inferred from loaded specs to determine which spec requirement sets are candidates.
 
-r[ref.prefix.coverage]
-When computing coverage, a reference MUST only be counted as covering a requirement if the reference's prefix matches the spec's configured prefix. References with non-matching prefixes MUST be ignored for that spec's coverage computation.
+r[ref.prefix.coverage+2]
+When computing coverage, a reference MUST only be counted as covering a requirement if the reference prefix matches the spec's inferred marker prefix and the requirement ID matches a rule in that spec. References with non-matching prefixes MUST be ignored for that spec's coverage computation.
 
-r[ref.prefix.filter]
-When validating a spec/implementation pair, tracey MUST only report "unknown requirement" errors for references whose prefix matches the spec being validated. References with prefixes that belong to other configured specs MUST be silently skipped, as they will be validated when those respective specs are checked.
+r[ref.prefix.filter+2]
+When validating a spec/implementation pair, tracey MUST only report "unknown requirement" errors for references whose prefix matches the spec being validated. References with prefixes that belong to other specs MUST be skipped for that validation target (including references that match rules in another spec sharing the same prefix).
 
 ## Cross-Workspace Implementation References
 
@@ -430,7 +461,6 @@ When started without a configuration file, tracey MUST watch for the creation of
 > specs (
 >   {
 >     name tracey
->     prefix r
 >     include (docs/spec/**/*.md)
 >     impls (
 >       {
@@ -443,7 +473,6 @@ When started without a configuration file, tracey MUST watch for the creation of
 >
 >   {
 >     name messaging-protocol
->     prefix m
 >     include (vendor/messaging-spec/**/*.md)
 >     source_url https://github.com/example/messaging-spec
 >     impls (
@@ -459,8 +488,8 @@ When started without a configuration file, tracey MUST watch for the creation of
 r[config.spec.name]
 Each spec configuration MUST have a `name` field with the spec name.
 
-r[config.spec.prefix]
-Each spec configuration MUST have a `prefix` field specifying the single-character or multi-character prefix used to identify this spec in markdown and source code annotations.
+r[config.spec.prefix+2]
+The `prefix` field in spec configuration is deprecated and MUST be rejected with an error if present. Tracey MUST infer each spec prefix directly from requirement markers in the spec markdown files.
 
 r[config.spec.include]
 Each spec configuration MUST have an `include` field with one or more glob patterns for markdown files containing requirement definitions.
@@ -483,13 +512,15 @@ Each impl configuration MAY have a `test_include` field with one or more glob pa
 r[config.impl.test_include.verify-only]
 Files matched by `test_include` patterns MUST only contain `verify` annotations. Any `impl` annotation in a test file is a hard error.
 
+r[config.impl.test_include.extraction]
+Annotations from files matched by `test_include` patterns MUST be extracted and included in coverage analysis. Specifically, `verify` annotations from test files MUST count toward the verification percentage for the implementation.
+
 Example configuration separating implementation and test files:
 
 ```styx
 specs (
   {
     name myapp
-    prefix r
     include (docs/spec/**/*.md)
     impls (
       {
@@ -506,11 +537,11 @@ In this example, `src/auth.rs` may contain `r[impl auth.token]` but `tests/auth_
 
 ### Multiple Specs
 
-r[config.multi-spec.prefix-namespace]
-When multiple specs are configured, the prefix serves as the namespace to disambiguate which spec a requirement belongs to.
+r[config.multi-spec.prefix-namespace+2]
+When multiple specs are configured, prefixes are inferred per spec from markdown requirement markers and used to route references to candidate specs. Specs MAY share a prefix; in that case, requirement ID matching determines whether a reference belongs to the validated spec.
 
 r[config.multi-spec.unique-within-spec]
-Requirement IDs MUST be unique within a single spec, but MAY be duplicated across different specs (since they use different prefixes).
+Requirement IDs MUST be unique within a single spec. They MAY be duplicated across different specs.
 
 Example: implementing both your own spec and an external specification:
 
@@ -519,7 +550,6 @@ specs (
   // Your project's internal specification
   {
     name myapp
-    prefix r
     include (docs/spec/**/*.md)
     impls (
       {
@@ -533,7 +563,6 @@ specs (
   // External HTTP/2 specification (obtained via git submodule)
   {
     name http2
-    prefix h2
     source_url https://github.com/http2/spec
     include (vendor/http2-spec/docs/**/*.md)
     impls (
@@ -547,8 +576,8 @@ specs (
 ```
 
 With this configuration:
-- `r[impl auth.login]` refers to `myapp` spec's `auth.login` requirement
-- `h2[impl stream.priority]` refers to `http2` spec's `stream.priority` requirement
+- 'r[impl auth.login]' refers to `myapp` spec's `auth.login` requirement
+- 'h2[impl stream.priority]' refers to `http2` spec's `stream.priority` requirement
 
 ## File Walking
 
@@ -895,8 +924,14 @@ The `tracey status` command MUST display the daemon's current status, including 
 r[daemon.cli.kill]
 The `tracey kill` command MUST send a shutdown signal to the running daemon and clean up any stale sockets.
 
+r[daemon.cli.gc]
+The `tracey gc` command MUST remove state directories whose `project-root` metadata points to a path that no longer exists on disk.
+
+> r[daemon.cli.gc.dry-run]
+> The `--dry-run` flag MUST cause the command to report what would be removed without deleting anything.
+
 r[daemon.logs.file]
-The daemon MUST write all log output to `.tracey/daemon.log` in the workspace root.
+The daemon MUST write all log output to `daemon.log` in the state directory.
 
 ## Validation
 
@@ -916,6 +951,15 @@ The system MUST identify requirements that are defined in specs but never refere
 
 r[validation.duplicates]
 The system MUST detect duplicate requirement IDs across all spec files.
+
+r[validation.stale.message-prefix]
+When reporting a stale requirement reference, the validation message MUST start with this exact sentence: `Implementation must be changed to match updated rule text — and ONLY ONCE THAT'S DONE must the code annotation be bumped`.
+
+r[validation.stale.diff]
+When reporting a stale requirement reference and source history is available, the validation message MUST include: previous rule text, current rule text, and a textual diff between them.
+
+r[validation.stale.diff.fallback]
+When reporting a stale requirement reference and source history is unavailable (for example, missing git metadata, shallow history, or no matching prior rule text), the validation message MUST include an explicit fallback note that rule-text history could not be retrieved.
 
 ## MCP Server
 
@@ -1033,6 +1077,9 @@ Large result sets SHOULD be paginated with hints showing how to retrieve more re
 
 r[mcp.validation.check]
 The `tracey_validate` tool MUST run all validation checks and return a report of issues found (broken refs, naming violations, circular deps, orphaned requirements, duplicates).
+
+r[mcp.validation.stale.message-prefix+2]
+When `tracey_validate` output includes stale-reference errors, each stale entry MUST use the same `[StaleRequirement]` prefix format as other error codes, with a concise human-readable message identifying the stale reference and current rule ID, followed by a hint to use `tracey query rule` for the full diff.
 
 r[dashboard.query.search]
 The dashboard MUST provide a search interface for finding requirements by keyword in their text or ID.
@@ -1231,7 +1278,7 @@ r[lsp.lifecycle.initialize]
 The server MUST respond to the `initialize` request with supported capabilities including diagnostics, hover, go-to-definition, and code actions.
 
 r[lsp.lifecycle.project-root]
-The server MUST use the project root (typically where `.config/tracey/config.yaml` is found) to locate the tracey configuration file.
+The server MUST use the project root (typically where `.config/tracey/config.styx` is found) to locate the tracey configuration file.
 
 ### Diagnostics
 
@@ -1263,6 +1310,15 @@ The server MAY publish diagnostics for requirement definitions that have no impl
 r[lsp.diagnostics.impl-in-test]
 The server MUST publish diagnostics for `impl` annotations in files matched by `test_include` patterns, with severity `Error`. Test files should only contain `verify` annotations.
 
+r[lsp.diagnostics.stale]
+The server MUST publish diagnostics for stale requirement references, with severity `Warning`.
+
+> r[lsp.diagnostics.stale.message-prefix]
+> Stale-reference diagnostics MUST start with this exact sentence: `Implementation must be changed to match updated rule text — and ONLY ONCE THAT'S DONE must the code annotation be bumped`.
+
+> r[lsp.diagnostics.stale.diff+2]
+> LSP stale-reference diagnostics MUST be concise: just the prefix sentence and a note identifying the stale reference and current rule ID. The detailed diff (previous text, current text, textual diff) is deferred to hover information. Validation and MCP output retains the verbose format including previous/current text and diff.
+
 r[lsp.diagnostics.on-change]
 Diagnostics MUST be updated when files are modified, using debouncing to avoid excessive recomputation.
 
@@ -1287,6 +1343,18 @@ Hovering over a requirement reference in source code MUST display the requiremen
 
 r[lsp.hover.prefix]
 Hovering over a requirement reference MUST include the spec name and source URL (if configured) alongside the requirement info, allowing users to see which specification the prefix maps to.
+
+r[lsp.hover.tail-diff+2]
+When hovering over a requirement reference that is "tail" — meaning the referenced version exactly matches the current rule version, and that version is greater than 1 — the hover MUST include a diff between the previous version of the rule text (N-1) and the current version (N).
+
+r[lsp.hover.stale-diff]
+When hovering over a stale requirement reference — meaning the referenced version is older than the current rule version — the hover MUST include a diff between the stale reference version's text and the current rule text.
+
+> r[lsp.hover.tail-diff.format+2]
+> For both tail and stale annotations, the diff MUST be presented as inline markdown with ~~strikethrough~~ for removed words and **bold** for added words, rendered under a "Changes from previous version" heading.
+
+> r[lsp.hover.tail-diff.fallback+2]
+> When the previous rule text cannot be retrieved (e.g., shallow git history or missing commits), the diff section MUST be omitted silently — no error or placeholder shown.
 
 ### Document Highlight
 
@@ -1414,12 +1482,12 @@ The server MAY provide inlay hints after requirement definitions showing impleme
 
 ## Zed Extension
 
-The tracey-zed extension integrates tracey with the Zed editor, providing requirement traceability features through the LSP server.
+The tracey-zed extension integrates tracey with the Zed editor, providing requirement traceability features through the LSP server and exposing query tools to the AI assistant through the MCP context server.
 
 ### Extension Structure
 
-r[zed.extension.manifest]
-The extension MUST provide an `extension.toml` manifest declaring the extension name, version, and language server configuration.
+r[zed.extension.manifest+2]
+The extension MUST provide an `extension.toml` manifest declaring the extension name, version, language server configuration, and context server configuration.
 
 r[zed.extension.language-server]
 The extension MUST configure tracey as a language server, specifying supported file types and the command to start the LSP server.
@@ -1430,6 +1498,14 @@ The extension MUST configure tracey as a language server, specifying supported f
 > - Arguments to start LSP mode (`lsp`)
 > - Supported file extensions (`.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.swift`, `.java`, `.md`)
 
+r[zed.extension.context-server]
+The extension MUST configure tracey as a context server (MCP), exposing tracey's query tools to Zed's AI assistant.
+
+> r[zed.extension.context-server-config]
+> The context server configuration MUST include:
+> - Binary name or path to the tracey executable
+> - Arguments to start MCP mode (`mcp`)
+
 ### File Type Support
 
 r[zed.filetypes.source]
@@ -1439,7 +1515,7 @@ r[zed.filetypes.spec]
 The extension MUST activate for markdown files matching the spec patterns in the tracey configuration.
 
 r[zed.filetypes.config]
-The extension SHOULD activate for the tracey configuration file (`.config/tracey/config.yaml`).
+The extension SHOULD activate for the tracey configuration file (`.config/tracey/config.styx`).
 
 ### Installation
 
@@ -1454,6 +1530,6 @@ The extension MUST document how to install the tracey binary, which is required 
 
 > r[zed.install.binary-options]
 > Installation documentation MUST cover:
-> - Installing via cargo (`cargo install tracey`)
+> - Installing via cargo (`cargo install --locked --git https://github.com/bearcove/tracey --branch main tracey`)
 > - Using pre-built binaries from releases
 > - Building from source

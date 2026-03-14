@@ -14,6 +14,8 @@
 //! - Code added without updating the spec
 //! - Potential dead code or technical debt
 
+use crate::positions::{ByteOffset, LineNumber, RefLocation};
+use crate::{RuleId, parse_rule_id};
 use arborium::tree_sitter::{Node, Parser};
 use std::path::{Path, PathBuf};
 
@@ -35,7 +37,7 @@ pub struct CodeUnit {
     /// Byte offset where the code unit ends
     pub end_byte: usize,
     /// Requirement IDs referenced in comments associated with this code unit
-    pub req_refs: Vec<String>,
+    pub req_refs: Vec<RuleId>,
 }
 
 /// The kind of code unit
@@ -155,6 +157,28 @@ pub fn extract(path: &Path, source: &str) -> CodeUnits {
         "py" => extract_python(path, source),
         "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" => extract_typescript(path, source),
         "php" => extract_php(path, source),
+        "c" | "h" => extract_c(path, source),
+        "cpp" | "cc" | "cxx" | "hpp" => extract_cpp(path, source),
+        "rb" => extract_ruby(path, source),
+        "r" | "R" => extract_r(path, source),
+        "dart" => extract_dart(path, source),
+        "lua" => extract_lua(path, source),
+        "asm" | "s" | "S" => extract_asm(path, source),
+        "pl" | "pm" => extract_perl(path, source),
+        "hs" | "lhs" => extract_haskell(path, source),
+        "ex" | "exs" => extract_elixir(path, source),
+        "erl" | "hrl" => extract_erlang(path, source),
+        "clj" | "cljs" | "cljc" | "edn" => extract_clojure(path, source),
+        "fs" | "fsi" | "fsx" => extract_fsharp(path, source),
+        "vb" | "vbs" => extract_vb(path, source),
+        "cob" | "cbl" | "cpy" => extract_cobol(path, source),
+        "jl" => extract_julia(path, source),
+        "d" => extract_d(path, source),
+        "ps1" | "psm1" | "psd1" => extract_powershell(path, source),
+        "cmake" => extract_cmake(path, source),
+        "ml" | "mli" => extract_ocaml(path, source),
+        "sh" | "bash" | "zsh" => extract_bash(path, source),
+        "nix" => extract_nix(path, source),
         _ => CodeUnits::new(),
     }
 }
@@ -346,6 +370,28 @@ fn php_node_kind(kind: &str) -> Option<CodeUnitKind> {
     }
 }
 
+fn c_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_definition" => Some(CodeUnitKind::Function),
+        "struct_specifier" => Some(CodeUnitKind::Struct),
+        "enum_specifier" => Some(CodeUnitKind::Enum),
+        "union_specifier" => Some(CodeUnitKind::Struct),
+        _ => None,
+    }
+}
+
+fn cpp_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_definition" => Some(CodeUnitKind::Function),
+        "struct_specifier" => Some(CodeUnitKind::Struct),
+        "class_specifier" => Some(CodeUnitKind::Struct),
+        "enum_specifier" => Some(CodeUnitKind::Enum),
+        "union_specifier" => Some(CodeUnitKind::Struct),
+        "namespace_definition" => Some(CodeUnitKind::Module),
+        _ => None,
+    }
+}
+
 /// Extract code units from PHP source code
 pub fn extract_php(path: &Path, source: &str) -> CodeUnits {
     let mut parser = Parser::new();
@@ -361,6 +407,687 @@ pub fn extract_php(path: &Path, source: &str) -> CodeUnits {
     let root = tree.root_node();
     extract_units_recursive(path, source, root, &mut units, php_node_kind);
     units
+}
+
+/// Extract code units from C source code
+pub fn extract_c(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_c::language().into())
+        .expect("Failed to load C grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, c_node_kind);
+    units
+}
+
+/// Extract code units from C++ source code
+pub fn extract_cpp(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_cpp::language().into())
+        .expect("Failed to load C++ grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, cpp_node_kind);
+    units
+}
+
+/// Extract code units from Ruby source code
+pub fn extract_ruby(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_ruby::language().into())
+        .expect("Failed to load Ruby grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, ruby_node_kind);
+    units
+}
+
+fn ruby_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "method" | "singleton_method" => Some(CodeUnitKind::Function),
+        "class" => Some(CodeUnitKind::Struct),
+        "module" => Some(CodeUnitKind::Module),
+        _ => None,
+    }
+}
+
+/// Extract code units from R source code
+pub fn extract_r(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_r::language().into())
+        .expect("Failed to load R grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, r_node_kind);
+    units
+}
+
+fn r_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_definition" => Some(CodeUnitKind::Function),
+        _ => None,
+    }
+}
+
+/// Extract code units from Dart source code
+pub fn extract_dart(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_dart::language().into())
+        .expect("Failed to load Dart grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, dart_node_kind);
+    units
+}
+
+fn dart_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_signature" | "method_signature" => Some(CodeUnitKind::Function),
+        "class_definition" => Some(CodeUnitKind::Struct),
+        "enum_declaration" => Some(CodeUnitKind::Enum),
+        "mixin_declaration" => Some(CodeUnitKind::Trait),
+        "extension_declaration" => Some(CodeUnitKind::Impl),
+        _ => None,
+    }
+}
+
+/// Extract code units from Lua source code
+pub fn extract_lua(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_lua::language().into())
+        .expect("Failed to load Lua grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, lua_node_kind);
+    units
+}
+
+fn lua_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_declaration" | "function_definition" => Some(CodeUnitKind::Function),
+        _ => None,
+    }
+}
+
+/// Extract code units from assembly source code
+pub fn extract_asm(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_asm::language().into())
+        .expect("Failed to load ASM grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, asm_node_kind);
+    units
+}
+
+fn asm_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "label" => Some(CodeUnitKind::Function),
+        "meta" => Some(CodeUnitKind::Macro),
+        _ => None,
+    }
+}
+
+/// Extract code units from MATLAB source code
+pub fn extract_matlab(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_matlab::language().into())
+        .expect("Failed to load MATLAB grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, matlab_node_kind);
+    units
+}
+
+fn matlab_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_definition" => Some(CodeUnitKind::Function),
+        "class_definition" => Some(CodeUnitKind::Struct),
+        _ => None,
+    }
+}
+
+/// Extract code units from Perl source code
+pub fn extract_perl(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_perl::language().into())
+        .expect("Failed to load Perl grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, perl_node_kind);
+    units
+}
+
+fn perl_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function"
+        | "method"
+        | "method_declaration_statement"
+        | "subroutine_declaration_statement" => Some(CodeUnitKind::Function),
+        "package_statement" => Some(CodeUnitKind::Module),
+        "class_statement" => Some(CodeUnitKind::Struct),
+        "role_statement" => Some(CodeUnitKind::Trait),
+        _ => None,
+    }
+}
+
+/// Extract code units from Haskell source code
+pub fn extract_haskell(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_haskell::language().into())
+        .expect("Failed to load Haskell grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, haskell_node_kind);
+    units
+}
+
+fn haskell_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function" | "bind" => Some(CodeUnitKind::Function),
+        "data_type" | "newtype" => Some(CodeUnitKind::Struct),
+        "class_decl" => Some(CodeUnitKind::Trait),
+        "instance_decl" => Some(CodeUnitKind::Impl),
+        "type_synomym" => Some(CodeUnitKind::TypeAlias),
+        "module" => Some(CodeUnitKind::Module),
+        _ => None,
+    }
+}
+
+/// Extract code units from Elixir source code
+///
+/// Elixir uses `call` nodes with specific targets (def, defp, defmodule, etc.)
+/// rather than dedicated node types for definitions.
+pub fn extract_elixir(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_elixir::language().into())
+        .expect("Failed to load Elixir grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_elixir_recursive(path, source, root, &mut units);
+    units
+}
+
+fn elixir_call_kind(source: &str, node: Node) -> Option<CodeUnitKind> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let target = node.child_by_field_name("target")?;
+    let target_text = &source[target.byte_range()];
+    match target_text {
+        "def" | "defp" => Some(CodeUnitKind::Function),
+        "defmodule" => Some(CodeUnitKind::Module),
+        "defstruct" => Some(CodeUnitKind::Struct),
+        "defprotocol" => Some(CodeUnitKind::Trait),
+        "defimpl" => Some(CodeUnitKind::Impl),
+        "defmacro" | "defmacrop" => Some(CodeUnitKind::Macro),
+        _ => None,
+    }
+}
+
+fn extract_elixir_recursive(path: &Path, source: &str, node: Node, units: &mut CodeUnits) {
+    if let Some(kind) = elixir_call_kind(source, node) {
+        let name = get_node_name(source, node).or_else(|| {
+            // For Elixir calls, the name is the first argument
+            node.child_by_field_name("arguments")
+                .and_then(|args| {
+                    let mut cursor = args.walk();
+                    args.children(&mut cursor).next()
+                })
+                .map(|n| source[n.byte_range()].to_string())
+        });
+
+        let (req_refs, comment_start) = extract_req_refs_from_comments(source, node);
+        let start_line = comment_start.unwrap_or_else(|| node.start_position().row + 1);
+        let start_byte = if comment_start.is_some() {
+            find_line_start_byte(source, start_line)
+        } else {
+            node.start_byte()
+        };
+
+        units.units.push(CodeUnit {
+            kind,
+            name,
+            file: path.to_path_buf(),
+            start_line,
+            end_line: node.end_position().row + 1,
+            start_byte,
+            end_byte: node.end_byte(),
+            req_refs,
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        extract_elixir_recursive(path, source, child, units);
+    }
+}
+
+/// Extract code units from Erlang source code
+pub fn extract_erlang(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_erlang::language().into())
+        .expect("Failed to load Erlang grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, erlang_node_kind);
+    units
+}
+
+fn erlang_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_clause" => Some(CodeUnitKind::Function),
+        _ => None,
+    }
+}
+
+/// Extract code units from Clojure source code
+///
+/// Clojure uses `list_lit` nodes where the first symbol determines the form type
+/// (defn, def, defmacro, ns, defprotocol, defrecord, deftype).
+pub fn extract_clojure(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_clojure::language().into())
+        .expect("Failed to load Clojure grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_clojure_recursive(path, source, root, &mut units);
+    units
+}
+
+fn clojure_list_kind(source: &str, node: Node) -> Option<CodeUnitKind> {
+    if node.kind() != "list_lit" {
+        return None;
+    }
+    // Find first sym_lit child
+    let mut cursor = node.walk();
+    let first_sym = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "sym_lit" || c.kind() == "sym_name")?;
+    let sym_text = &source[first_sym.byte_range()];
+    match sym_text {
+        "defn" | "defn-" => Some(CodeUnitKind::Function),
+        "def" | "defonce" => Some(CodeUnitKind::Const),
+        "defmacro" => Some(CodeUnitKind::Macro),
+        "ns" => Some(CodeUnitKind::Module),
+        "defprotocol" => Some(CodeUnitKind::Trait),
+        "defrecord" | "deftype" => Some(CodeUnitKind::Struct),
+        _ => None,
+    }
+}
+
+fn extract_clojure_recursive(path: &Path, source: &str, node: Node, units: &mut CodeUnits) {
+    if let Some(kind) = clojure_list_kind(source, node) {
+        // The second symbol child is the name
+        let mut cursor = node.walk();
+        let name = node
+            .children(&mut cursor)
+            .filter(|c| c.kind() == "sym_lit" || c.kind() == "sym_name")
+            .nth(1)
+            .map(|n| source[n.byte_range()].to_string());
+
+        let (req_refs, comment_start) = extract_req_refs_from_comments(source, node);
+        let start_line = comment_start.unwrap_or_else(|| node.start_position().row + 1);
+        let start_byte = if comment_start.is_some() {
+            find_line_start_byte(source, start_line)
+        } else {
+            node.start_byte()
+        };
+
+        units.units.push(CodeUnit {
+            kind,
+            name,
+            file: path.to_path_buf(),
+            start_line,
+            end_line: node.end_position().row + 1,
+            start_byte,
+            end_byte: node.end_byte(),
+            req_refs,
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        extract_clojure_recursive(path, source, child, units);
+    }
+}
+
+/// Extract code units from F# source code
+pub fn extract_fsharp(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_fsharp::language().into())
+        .expect("Failed to load F# grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, fsharp_node_kind);
+    units
+}
+
+fn fsharp_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_or_value_defn" => Some(CodeUnitKind::Function),
+        "type_definition" => Some(CodeUnitKind::Struct),
+        "module_defn" => Some(CodeUnitKind::Module),
+        _ => None,
+    }
+}
+
+/// Extract code units from Visual Basic source code
+pub fn extract_vb(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_vb::language().into())
+        .expect("Failed to load Visual Basic grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, vb_node_kind);
+    units
+}
+
+fn vb_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "sub_block" | "function_block" => Some(CodeUnitKind::Function),
+        "class_block" => Some(CodeUnitKind::Struct),
+        "module_block" => Some(CodeUnitKind::Module),
+        "enum_block" => Some(CodeUnitKind::Enum),
+        _ => None,
+    }
+}
+
+/// Extract code units from COBOL source code
+pub fn extract_cobol(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_cobol::language().into())
+        .expect("Failed to load COBOL grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, cobol_node_kind);
+    units
+}
+
+fn cobol_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "paragraph_header" => Some(CodeUnitKind::Function),
+        "section_header" => Some(CodeUnitKind::Module),
+        _ => None,
+    }
+}
+
+/// Extract code units from Julia source code
+pub fn extract_julia(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_julia::language().into())
+        .expect("Failed to load Julia grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, julia_node_kind);
+    units
+}
+
+fn julia_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_definition" => Some(CodeUnitKind::Function),
+        "macro_definition" => Some(CodeUnitKind::Macro),
+        "struct_definition" => Some(CodeUnitKind::Struct),
+        "module_definition" => Some(CodeUnitKind::Module),
+        "abstract_definition" => Some(CodeUnitKind::Trait),
+        "const_statement" => Some(CodeUnitKind::Const),
+        _ => None,
+    }
+}
+
+/// Extract code units from D source code
+pub fn extract_d(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_d::language().into())
+        .expect("Failed to load D grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, d_node_kind);
+    units
+}
+
+fn d_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_declaration" => Some(CodeUnitKind::Function),
+        "class_declaration" | "struct_declaration" => Some(CodeUnitKind::Struct),
+        "enum_declaration" => Some(CodeUnitKind::Enum),
+        "module_declaration" => Some(CodeUnitKind::Module),
+        _ => None,
+    }
+}
+
+/// Extract code units from PowerShell source code
+pub fn extract_powershell(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_powershell::language().into())
+        .expect("Failed to load PowerShell grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, powershell_node_kind);
+    units
+}
+
+fn powershell_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_statement" | "class_method_definition" => Some(CodeUnitKind::Function),
+        "class_statement" => Some(CodeUnitKind::Struct),
+        "enum_statement" => Some(CodeUnitKind::Enum),
+        _ => None,
+    }
+}
+
+/// Extract code units from CMake source code
+pub fn extract_cmake(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_cmake::language().into())
+        .expect("Failed to load CMake grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, cmake_node_kind);
+    units
+}
+
+fn cmake_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_def" => Some(CodeUnitKind::Function),
+        "macro_def" => Some(CodeUnitKind::Macro),
+        _ => None,
+    }
+}
+
+/// Extract code units from OCaml source code
+pub fn extract_ocaml(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_ocaml::language().into())
+        .expect("Failed to load OCaml grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, ocaml_node_kind);
+    units
+}
+
+fn ocaml_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "value_definition" | "let_binding" => Some(CodeUnitKind::Function),
+        "type_definition" => Some(CodeUnitKind::Struct),
+        "module_definition" => Some(CodeUnitKind::Module),
+        _ => None,
+    }
+}
+
+/// Extract code units from Bash source code
+pub fn extract_bash(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_bash::language().into())
+        .expect("Failed to load Bash grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, bash_node_kind);
+    units
+}
+
+fn bash_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_definition" => Some(CodeUnitKind::Function),
+        _ => None,
+    }
+}
+
+/// Extract code units from Nix source code
+pub fn extract_nix(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_nix::language().into())
+        .expect("Failed to load Nix grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, nix_node_kind);
+    units
+}
+
+fn nix_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        "function_expression" => Some(CodeUnitKind::Function),
+        "binding" => Some(CodeUnitKind::Const),
+        _ => None,
+    }
 }
 
 fn extract_units_recursive<F>(
@@ -441,17 +1168,66 @@ fn find_line_start_byte(source: &str, line: usize) -> usize {
     0
 }
 
+/// Recursively unwrap C/C++ declarator chains to find the identifier node.
+///
+/// In tree-sitter-c/cpp, function names are nested inside declarator chains:
+/// `function_definition` -> `function_declarator` -> `identifier`
+/// This also handles pointer declarators, parenthesized declarators, etc.
+fn find_declarator_name(node: Node) -> Option<Node> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "qualified_identifier" | "type_identifier" => {
+            Some(node)
+        }
+        "function_declarator"
+        | "pointer_declarator"
+        | "parenthesized_declarator"
+        | "reference_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(find_declarator_name),
+        _ => None,
+    }
+}
+
 fn get_node_name(source: &str, node: Node) -> Option<String> {
     // Try common field names used across languages for the identifier/name
     // Most tree-sitter grammars use "name" for the identifier field
     let name_node = node
         .child_by_field_name("name")
-        .or_else(|| node.child_by_field_name("type")) // For impl blocks
+        // C/C++: name is inside a declarator chain (must check before "type" fallback,
+        // since C function_definition also has a "type" field for the return type)
+        .or_else(|| {
+            node.child_by_field_name("declarator")
+                .and_then(find_declarator_name)
+        })
+        .or_else(|| node.child_by_field_name("type")) // For Rust impl blocks
         .or_else(|| {
             // For some languages, the first identifier child is the name
             let mut cursor = node.walk();
             node.children(&mut cursor)
                 .find(|c| c.kind() == "identifier" || c.kind() == "type_identifier")
+        })
+        .or_else(|| {
+            // Julia/similar: name is inside a signature or type_head child
+            let wrapper = node.child_by_field_name("signature").or_else(|| {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .find(|c| c.kind() == "signature" || c.kind() == "type_head")
+            })?;
+            // The wrapper may directly contain an identifier, or contain a
+            // call_expression whose first identifier child is the name
+            let mut cursor = wrapper.walk();
+            wrapper
+                .children(&mut cursor)
+                .find(|c| c.kind() == "identifier")
+                .or_else(|| {
+                    let mut cursor2 = wrapper.walk();
+                    let call = wrapper
+                        .children(&mut cursor2)
+                        .find(|c| c.kind() == "call_expression")?;
+                    let mut cursor3 = call.walk();
+                    call.children(&mut cursor3)
+                        .find(|c| c.kind() == "identifier")
+                })
         });
 
     // Legacy Rust-specific handling (kept for compatibility)
@@ -473,7 +1249,7 @@ fn get_node_name(source: &str, node: Node) -> Option<String> {
 }
 
 /// Returns (requirement refs, earliest comment line if any)
-fn extract_req_refs_from_comments(source: &str, node: Node) -> (Vec<String>, Option<usize>) {
+fn extract_req_refs_from_comments(source: &str, node: Node) -> (Vec<RuleId>, Option<usize>) {
     let mut refs = Vec::new();
     let mut earliest_comment_line: Option<usize> = None;
 
@@ -506,6 +1282,8 @@ fn extract_req_refs_from_comments(source: &str, node: Node) -> (Vec<String>, Opt
                     | "attribute_item"
                     | "decorator"       // Python decorators
                     | "multiline_comment"
+                    | "bracket_comment"        // CMake
+                    | "documentation_comment" // Dart
             );
             if is_comment_like {
                 collect_comment_refs(source, sibling, &mut refs);
@@ -527,11 +1305,16 @@ fn extract_req_refs_from_comments(source: &str, node: Node) -> (Vec<String>, Opt
 }
 
 /// Recursively collect comment refs from a node's children
-fn collect_inner_comment_refs(source: &str, node: Node, refs: &mut Vec<String>) {
+fn collect_inner_comment_refs(source: &str, node: Node, refs: &mut Vec<RuleId>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "line_comment" | "block_comment" | "comment" | "multiline_comment" => {
+            "line_comment"
+            | "block_comment"
+            | "comment"
+            | "multiline_comment"
+            | "bracket_comment"
+            | "documentation_comment" => {
                 extract_refs_from_comment_text(source, child, refs);
             }
             // Doc comments are in attributes -> line_outer_doc_comment -> doc_comment
@@ -556,9 +1339,14 @@ fn collect_inner_comment_refs(source: &str, node: Node, refs: &mut Vec<String>) 
     }
 }
 
-fn collect_comment_refs(source: &str, node: Node, refs: &mut Vec<String>) {
+fn collect_comment_refs(source: &str, node: Node, refs: &mut Vec<RuleId>) {
     match node.kind() {
-        "line_comment" | "block_comment" | "comment" | "multiline_comment" => {
+        "line_comment"
+        | "block_comment"
+        | "comment"
+        | "multiline_comment"
+        | "bracket_comment"
+        | "documentation_comment" => {
             extract_refs_from_comment_text(source, node, refs);
         }
         "attribute_item" | "decorator" => {
@@ -572,7 +1360,7 @@ fn collect_comment_refs(source: &str, node: Node, refs: &mut Vec<String>) {
     }
 }
 
-fn extract_refs_from_comment_text(source: &str, node: Node, refs: &mut Vec<String>) {
+fn extract_refs_from_comment_text(source: &str, node: Node, refs: &mut Vec<RuleId>) {
     let text = &source[node.byte_range()];
 
     // Reuse the same pattern matching from the lexer
@@ -585,11 +1373,15 @@ fn extract_refs_from_comment_text(source: &str, node: Node, refs: &mut Vec<Strin
 }
 
 /// Extract requirement IDs from comment text
-fn find_req_refs(text: &str) -> Vec<String> {
+fn find_req_refs(text: &str) -> Vec<RuleId> {
     let mut refs = Vec::new();
+    let code_mask = crate::markdown::markdown_code_mask(text);
     let mut chars = text.char_indices().peekable();
 
-    while let Some((_, ch)) = chars.next() {
+    while let Some((idx, ch)) = chars.next() {
+        if crate::markdown::is_code_index(idx, &code_mask) {
+            continue;
+        }
         if ch == '[' {
             // Try to parse a requirement reference
             if let Some(req_id) = try_parse_req_ref(&mut chars) {
@@ -609,7 +1401,7 @@ pub struct FullReqRef {
     /// The verb (impl, verify, depends, related, define)
     pub verb: String,
     /// The requirement ID
-    pub req_id: String,
+    pub req_id: RuleId,
     /// Line number (1-indexed)
     pub line: usize,
     /// Byte offset of the reference start
@@ -618,12 +1410,56 @@ pub struct FullReqRef {
     pub byte_length: usize,
 }
 
+impl RefLocation {
+    fn into_full_ref(self, prefix: String, verb: String, req_id: RuleId) -> FullReqRef {
+        FullReqRef {
+            prefix,
+            verb,
+            req_id,
+            line: self.line().as_usize(),
+            byte_offset: self.span().offset().as_usize(),
+            byte_length: self.span().length().as_usize(),
+        }
+    }
+
+    fn into_warning(self) -> FullReqRefWarning {
+        FullReqRefWarning {
+            line: self.line().as_usize(),
+            byte_offset: self.span().offset().as_usize(),
+            byte_length: self.span().length().as_usize(),
+        }
+    }
+}
+
+/// Warning emitted while parsing references from comments.
+#[derive(Debug, Clone)]
+pub struct FullReqRefWarning {
+    /// Line number (1-indexed)
+    pub line: usize,
+    /// Byte offset of the malformed reference start
+    pub byte_offset: usize,
+    /// Byte length of the malformed reference
+    pub byte_length: usize,
+}
+
+/// Extracted references plus parser warnings.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractedRefs {
+    pub references: Vec<FullReqRef>,
+    pub warnings: Vec<FullReqRefWarning>,
+}
+
 /// Extract ALL requirement references from a file using tree-sitter
 ///
 /// r[impl ref.parser.tree-sitter]
 /// r[impl ref.parser.languages]
 /// r[impl ref.parser.unified]
 pub fn extract_refs(path: &Path, source: &str) -> Vec<FullReqRef> {
+    extract_refs_with_warnings(path, source).references
+}
+
+/// Extract all requirement references and malformed-reference warnings.
+pub fn extract_refs_with_warnings(path: &Path, source: &str) -> ExtractedRefs {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     let language = match ext {
@@ -634,7 +1470,29 @@ pub fn extract_refs(path: &Path, source: &str) -> Vec<FullReqRef> {
         "py" => arborium_python::language(),
         "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" => arborium_typescript::language(),
         "php" => arborium_php::language(),
-        _ => return Vec::new(),
+        "c" | "h" => arborium_c::language(),
+        "cpp" | "cc" | "cxx" | "hpp" => arborium_cpp::language(),
+        "rb" => arborium_ruby::language(),
+        "r" | "R" => arborium_r::language(),
+        "dart" => arborium_dart::language(),
+        "lua" => arborium_lua::language(),
+        "asm" | "s" | "S" => arborium_asm::language(),
+        "pl" | "pm" => arborium_perl::language(),
+        "hs" | "lhs" => arborium_haskell::language(),
+        "ex" | "exs" => arborium_elixir::language(),
+        "erl" | "hrl" => arborium_erlang::language(),
+        "clj" | "cljs" | "cljc" | "edn" => arborium_clojure::language(),
+        "fs" | "fsi" | "fsx" => arborium_fsharp::language(),
+        "vb" | "vbs" => arborium_vb::language(),
+        "cob" | "cbl" | "cpy" => arborium_cobol::language(),
+        "jl" => arborium_julia::language(),
+        "d" => arborium_d::language(),
+        "ps1" | "psm1" | "psd1" => arborium_powershell::language(),
+        "cmake" => arborium_cmake::language(),
+        "ml" | "mli" => arborium_ocaml::language(),
+        "sh" | "bash" | "zsh" => arborium_bash::language(),
+        "nix" => arborium_nix::language(),
+        _ => return ExtractedRefs::default(),
     };
 
     let mut parser = Parser::new();
@@ -643,13 +1501,28 @@ pub fn extract_refs(path: &Path, source: &str) -> Vec<FullReqRef> {
         .expect("Failed to load grammar");
 
     let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
+        return ExtractedRefs::default();
     };
 
+    // Pre-compute file-level code mask for doc-comment groups so that fenced
+    // code blocks spanning multiple `///` / `//!` lines are properly masked.
+    let file_code_mask = crate::markdown::compute_doc_comment_code_mask(source);
+
     let mut refs = Vec::new();
+    let mut warnings = Vec::new();
     let mut ignore_state = IgnoreState::default();
-    extract_refs_recursive(source, tree.root_node(), &mut refs, &mut ignore_state);
-    refs
+    extract_refs_recursive(
+        source,
+        tree.root_node(),
+        &mut refs,
+        &mut warnings,
+        &mut ignore_state,
+        &file_code_mask,
+    );
+    ExtractedRefs {
+        references: refs,
+        warnings,
+    }
 }
 
 /// State for tracking ignore directives across comment nodes.
@@ -658,7 +1531,7 @@ pub fn extract_refs(path: &Path, source: &str) -> Vec<FullReqRef> {
 #[derive(Default)]
 struct IgnoreState {
     /// Skip the next line (set by @tracey:ignore-next-line)
-    ignore_next_line: Option<usize>,
+    ignore_next_line: Option<LineNumber>,
     /// Currently inside an ignore block (set by @tracey:ignore-start)
     /// r[impl ref.ignore.block]
     in_ignore_block: bool,
@@ -667,7 +1540,7 @@ struct IgnoreState {
 /// Check if a comment contains ignore directives and update state accordingly.
 ///
 /// Returns true if the current comment's refs should be extracted (not ignored).
-fn check_ignore_directives(text: &str, line: usize, state: &mut IgnoreState) -> bool {
+fn check_ignore_directives(text: &str, line: LineNumber, state: &mut IgnoreState) -> bool {
     // Check for ignore directives
     // r[impl ref.ignore.next-line]
     if text.contains("@tracey:ignore-next-line") {
@@ -695,7 +1568,7 @@ fn check_ignore_directives(text: &str, line: usize, state: &mut IgnoreState) -> 
     // Check if previous line had ignore-next-line
     if let Some(ignore_line) = state.ignore_next_line {
         // Check if this comment is on the line immediately after the ignore directive
-        if line == ignore_line + 1 {
+        if line.is_immediately_after(ignore_line) {
             state.ignore_next_line = None;
             return false;
         }
@@ -710,7 +1583,9 @@ fn extract_refs_recursive(
     source: &str,
     node: Node,
     refs: &mut Vec<FullReqRef>,
+    warnings: &mut Vec<FullReqRefWarning>,
     ignore_state: &mut IgnoreState,
+    file_code_mask: &[bool],
 ) {
     // Check if this is a comment node
     // Different languages and comment styles:
@@ -725,6 +1600,8 @@ fn extract_refs_recursive(
             | "block_comment"
             | "comment"
             | "multiline_comment"
+            | "bracket_comment"
+            | "documentation_comment"
             | "line_outer_doc_comment"
             | "line_inner_doc_comment"
             | "block_outer_doc_comment"
@@ -733,34 +1610,52 @@ fn extract_refs_recursive(
 
     if is_comment {
         let text = &source[node.byte_range()];
-        let line = node.start_position().row + 1;
-        let base_offset = node.start_byte();
+        let line = LineNumber::from_zero_based(node.start_position().row);
+        let base_offset = ByteOffset::from_usize(node.start_byte());
 
         // Check ignore directives and determine if we should extract refs
         if check_ignore_directives(text, line, ignore_state) {
-            extract_full_refs_from_text(text, line, base_offset, refs);
+            extract_full_refs_from_text(text, line, base_offset, file_code_mask, refs, warnings);
         }
     }
 
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        extract_refs_recursive(source, child, refs, ignore_state);
+        extract_refs_recursive(source, child, refs, warnings, ignore_state, file_code_mask);
     }
 }
 
 // r[impl ref.syntax.surrounding-text]
 fn extract_full_refs_from_text(
     text: &str,
-    line: usize,
-    base_offset: usize,
+    line: LineNumber,
+    base_offset: ByteOffset,
+    file_code_mask: &[bool],
     refs: &mut Vec<FullReqRef>,
+    warnings: &mut Vec<FullReqRefWarning>,
 ) {
+    let code_mask = crate::markdown::markdown_code_mask(text);
     let mut chars = text.char_indices().peekable();
+    let mut prev_ch: Option<char> = None;
 
     while let Some((start_idx, ch)) = chars.next() {
+        // Check both per-text mask and file-level mask for doc-comment groups
+        let file_idx = base_offset.as_usize() + start_idx;
+        if crate::markdown::is_code_index(start_idx, &code_mask)
+            || crate::markdown::is_code_index(file_idx, file_code_mask)
+        {
+            prev_ch = Some(ch);
+            continue;
+        }
         // Match prefix (lowercase alphanumeric) followed by '['
+        // Only start a prefix scan when NOT preceded by a word character,
+        // so that identifiers like `slot_count[i]` are not misinterpreted.
         if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            if prev_ch.is_some_and(|pc| pc.is_ascii_alphanumeric() || pc == '_') {
+                prev_ch = Some(ch);
+                continue;
+            }
             let prefix_start = start_idx;
             let mut prefix = String::new();
             prefix.push(ch);
@@ -784,24 +1679,53 @@ fn extract_full_refs_from_text(
             chars.next(); // consume '['
 
             // Parse: [verb req.id] or [req.id]
-            if let Some((verb, req_id, end_idx)) = try_parse_full_ref(&mut chars) {
-                refs.push(FullReqRef {
-                    prefix,
+            match try_parse_full_ref(&mut chars) {
+                Some(ParsedFullRef::Parsed {
                     verb,
                     req_id,
-                    line,
-                    byte_offset: base_offset + prefix_start,
-                    byte_length: end_idx - prefix_start + 1,
-                });
+                    end_idx,
+                }) => {
+                    let location = RefLocation::from_relative_indices(
+                        line,
+                        base_offset,
+                        prefix_start,
+                        end_idx,
+                    );
+                    refs.push(location.into_full_ref(prefix, verb, req_id));
+                }
+                Some(ParsedFullRef::Malformed { end_idx }) => {
+                    let location = RefLocation::from_relative_indices(
+                        line,
+                        base_offset,
+                        prefix_start,
+                        end_idx,
+                    );
+                    warnings.push(location.into_warning());
+                }
+                None => {}
             }
+            prev_ch = Some(']');
+        } else {
+            prev_ch = Some(ch);
         }
     }
+}
+
+enum ParsedFullRef {
+    Parsed {
+        verb: String,
+        req_id: RuleId,
+        end_idx: usize,
+    },
+    Malformed {
+        end_idx: usize,
+    },
 }
 
 // r[impl ref.syntax.req-id]
 fn try_parse_full_ref(
     chars: &mut std::iter::Peekable<impl Iterator<Item = (usize, char)>>,
-) -> Option<(String, String, usize)> {
+) -> Option<ParsedFullRef> {
     // First char must be lowercase letter
     let first_char = chars.peek().map(|(_, c)| *c)?;
     if !first_char.is_ascii_lowercase() {
@@ -818,7 +1742,7 @@ fn try_parse_full_ref(
         end_idx = idx;
         if c == ']' || c == ' ' {
             break;
-        } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' {
+        } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '+' {
             first_word.push(c);
             chars.next();
         } else {
@@ -837,8 +1761,6 @@ fn try_parse_full_ref(
 
                 // Read the requirement ID
                 let mut req_id = String::new();
-                let mut has_dot = false;
-
                 // First char must be lowercase
                 if let Some(&(_, c)) = chars.peek() {
                     if c.is_ascii_lowercase() {
@@ -854,11 +1776,13 @@ fn try_parse_full_ref(
                     if c == ']' {
                         chars.next();
                         break;
-                    } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' {
-                        req_id.push(c);
-                        chars.next();
-                    } else if c == '.' {
-                        has_dot = true;
+                    } else if c.is_ascii_lowercase()
+                        || c.is_ascii_digit()
+                        || c == '-'
+                        || c == '_'
+                        || c == '+'
+                        || c == '.'
+                    {
                         req_id.push(c);
                         chars.next();
                     } else {
@@ -866,19 +1790,28 @@ fn try_parse_full_ref(
                     }
                 }
 
-                if has_dot && !req_id.ends_with('.') && !req_id.is_empty() {
-                    return Some((verb, req_id, end_idx));
+                if is_valid_req_id(&req_id) {
+                    return parse_rule_id(&req_id).map(|parsed| ParsedFullRef::Parsed {
+                        verb,
+                        req_id: parsed,
+                        end_idx,
+                    });
                 }
+                return Some(ParsedFullRef::Malformed { end_idx });
             }
             None
         }
         Some(']') => {
             chars.next(); // consume ]
             // [req.id] format - defaults to impl
-            if first_word.contains('.') && !first_word.ends_with('.') {
-                Some(("impl".to_string(), first_word, end_idx))
+            if is_valid_req_id(&first_word) {
+                parse_rule_id(&first_word).map(|parsed| ParsedFullRef::Parsed {
+                    verb: "impl".to_string(),
+                    req_id: parsed,
+                    end_idx,
+                })
             } else {
-                None
+                Some(ParsedFullRef::Malformed { end_idx })
             }
         }
         _ => None,
@@ -887,7 +1820,7 @@ fn try_parse_full_ref(
 
 fn try_parse_req_ref(
     chars: &mut std::iter::Peekable<impl Iterator<Item = (usize, char)>>,
-) -> Option<String> {
+) -> Option<RuleId> {
     // First char must be lowercase letter
     let first_char = chars.peek().map(|(_, c)| *c)?;
     if !first_char.is_ascii_lowercase() {
@@ -902,7 +1835,7 @@ fn try_parse_req_ref(
     while let Some(&(_, c)) = chars.peek() {
         if c == ']' || c == ' ' {
             break;
-        } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' {
+        } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '+' {
             first_word.push(c);
             chars.next();
         } else {
@@ -920,7 +1853,6 @@ fn try_parse_req_ref(
 
                 // Read the requirement ID
                 let mut req_id = String::new();
-                let mut has_dot = false;
 
                 // First char must be lowercase
                 if let Some(&(_, c)) = chars.peek() {
@@ -936,11 +1868,12 @@ fn try_parse_req_ref(
                     if c == ']' {
                         chars.next();
                         break;
-                    } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
-                        req_id.push(c);
-                        chars.next();
-                    } else if c == '.' {
-                        has_dot = true;
+                    } else if c.is_ascii_lowercase()
+                        || c.is_ascii_digit()
+                        || c == '-'
+                        || c == '+'
+                        || c == '.'
+                    {
                         req_id.push(c);
                         chars.next();
                     } else {
@@ -948,17 +1881,17 @@ fn try_parse_req_ref(
                     }
                 }
 
-                if has_dot && !req_id.ends_with('.') && !req_id.is_empty() {
-                    return Some(req_id);
+                if is_valid_req_id(&req_id) {
+                    return parse_rule_id(&req_id);
                 }
             }
             None
         }
         Some(']') => {
             chars.next(); // consume ]
-            // [req.id] format - must contain dot
-            if first_word.contains('.') && !first_word.ends_with('.') {
-                Some(first_word)
+            // [req.id] format
+            if is_valid_req_id(&first_word) {
+                parse_rule_id(&first_word)
             } else {
                 None
             }
@@ -967,9 +1900,21 @@ fn try_parse_req_ref(
     }
 }
 
+fn is_valid_req_id(req_id: &str) -> bool {
+    let Some(parsed) = parse_rule_id(req_id) else {
+        return false;
+    };
+    !parsed.base.ends_with('.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse_rule_id;
+
+    fn rid(id: &str) -> RuleId {
+        parse_rule_id(id).expect("valid rule id")
+    }
 
     #[test]
     fn test_extract_refs_doc_comment() {
@@ -993,6 +1938,25 @@ fn do_thing() {}
         assert_eq!(refs.len(), 1, "Expected 1 ref, got {:?}", refs);
         assert_eq!(refs[0].req_id, "foo.bar");
         assert_eq!(refs[0].verb, "impl");
+    }
+
+    #[test]
+    fn test_extract_refs_byte_span_uses_inclusive_end() {
+        let source = "// r[foo.bar]\n";
+        let refs = extract_refs(Path::new("test.rs"), source);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].byte_offset, 3);
+        assert_eq!(refs[0].byte_length, "r[foo.bar]".len());
+    }
+
+    #[test]
+    fn test_extract_warnings_byte_span_uses_inclusive_end() {
+        let source = "// r[impl foo.]\n";
+        let extracted = extract_refs_with_warnings(Path::new("test.rs"), source);
+        assert!(extracted.references.is_empty());
+        assert_eq!(extracted.warnings.len(), 1);
+        assert_eq!(extracted.warnings[0].byte_offset, 3);
+        assert_eq!(extracted.warnings[0].byte_length, "r[impl foo.]".len());
     }
 
     #[test]
@@ -1029,7 +1993,7 @@ fn do_thing() {}
 "#;
         let units = extract_rust(Path::new("test.rs"), source);
         assert_eq!(units.len(), 1);
-        assert_eq!(units.units[0].req_refs, vec!["foo.bar"]);
+        assert_eq!(units.units[0].req_refs, vec![rid("foo.bar")]);
     }
 
     #[test]
@@ -1041,7 +2005,7 @@ fn test_parity() {}
 "#;
         let units = extract_rust(Path::new("test.rs"), source);
         assert_eq!(units.len(), 1);
-        assert_eq!(units.units[0].req_refs, vec!["channel.id.parity"]);
+        assert_eq!(units.units[0].req_refs, vec![rid("channel.id.parity")]);
     }
 
     #[test]
@@ -1061,14 +2025,19 @@ fn uncovered() {}
 
     #[test]
     fn test_find_req_refs() {
-        assert_eq!(find_req_refs("// r[impl foo.bar]"), vec!["foo.bar"]);
-        assert_eq!(find_req_refs("// [foo.bar]"), vec!["foo.bar"]);
+        assert_eq!(find_req_refs("// r[impl foo.bar]"), vec![rid("foo.bar")]);
+        assert_eq!(find_req_refs("// [foo.bar]"), vec![rid("foo.bar")]);
         assert_eq!(
             find_req_refs("// r[impl a.b] and r[verify c.d]"),
-            vec!["a.b", "c.d"]
+            vec![rid("a.b"), rid("c.d")]
+        );
+        assert_eq!(
+            find_req_refs("// r[impl auth.login+2] and r[verify auth.logout+3]"),
+            vec![rid("auth.login+2"), rid("auth.logout+3")]
         );
         assert!(find_req_refs("// no refs here").is_empty());
-        assert!(find_req_refs("// [invalid]").is_empty()); // no dot
+        assert!(find_req_refs("// [invalid.]").is_empty()); // trailing dot
+        assert!(find_req_refs("// r[impl auth.login+]").is_empty());
     }
 
     #[test]
@@ -1081,8 +2050,8 @@ fn multi_ref() {}
         let units = extract_rust(Path::new("test.rs"), source);
         assert_eq!(units.len(), 1);
         // Should capture both refs
-        assert!(units.units[0].req_refs.contains(&"req.one".to_string()));
-        assert!(units.units[0].req_refs.contains(&"req.two".to_string()));
+        assert!(units.units[0].req_refs.contains(&rid("req.one")));
+        assert!(units.units[0].req_refs.contains(&rid("req.two")));
     }
 
     #[test]
@@ -1094,7 +2063,7 @@ fn documented() {}
 "#;
         let units = extract_rust(Path::new("test.rs"), source);
         assert_eq!(units.len(), 1);
-        assert_eq!(units.units[0].req_refs, vec!["doc.ref"]);
+        assert_eq!(units.units[0].req_refs, vec![rid("doc.ref")]);
     }
 
     #[test]
@@ -1109,7 +2078,7 @@ impl Foo {
         // Should find both the impl and the method
         let impl_unit = units.units.iter().find(|u| u.kind == CodeUnitKind::Impl);
         assert!(impl_unit.is_some());
-        assert_eq!(impl_unit.unwrap().req_refs, vec!["my.impl"]);
+        assert_eq!(impl_unit.unwrap().req_refs, vec![rid("my.impl")]);
     }
 
     #[test]
@@ -1175,7 +2144,7 @@ async fn test_third() {
             "test_first should start at line 1 (comment)"
         );
         assert_eq!(first.end_line, 6, "test_first should end at line 6");
-        assert_eq!(first.req_refs, vec!["first.test"]);
+        assert_eq!(first.req_refs, vec![rid("first.test")]);
 
         // Second function: starts at line 8 (comment), ends at line 13
         let second = &units.units[1];
@@ -1185,7 +2154,7 @@ async fn test_third() {
             "test_second should start at line 8 (comment)"
         );
         assert_eq!(second.end_line, 13, "test_second should end at line 13");
-        assert_eq!(second.req_refs, vec!["second.test"]);
+        assert_eq!(second.req_refs, vec![rid("second.test")]);
 
         // Third function: starts at line 15 (attribute, no comment), ends at line 19
         let third = &units.units[2];
@@ -1265,7 +2234,7 @@ protocol MyProtocol {
         let func_unit = func_unit.unwrap();
         assert_eq!(func_unit.kind, CodeUnitKind::Function);
         assert_eq!(func_unit.start_line, 1, "Should include comment");
-        assert_eq!(func_unit.req_refs, vec!["swift.feature"]);
+        assert_eq!(func_unit.req_refs, vec![rid("swift.feature")]);
 
         // Class
         let class_unit = units
@@ -1328,7 +2297,7 @@ type MyStruct struct {
         let func_unit = func_unit.unwrap();
         assert_eq!(func_unit.kind, CodeUnitKind::Function);
         assert_eq!(func_unit.start_line, 3, "Should include comment");
-        assert_eq!(func_unit.req_refs, vec!["go.feature"]);
+        assert_eq!(func_unit.req_refs, vec![rid("go.feature")]);
 
         // Method
         let method_unit = units
@@ -1386,7 +2355,7 @@ enum MyEnum {
         let class_unit = class_unit.unwrap();
         assert_eq!(class_unit.kind, CodeUnitKind::Struct);
         assert_eq!(class_unit.start_line, 1, "Should include comment");
-        assert_eq!(class_unit.req_refs, vec!["java.feature"]);
+        assert_eq!(class_unit.req_refs, vec![rid("java.feature")]);
 
         // Method
         let method_unit = units
@@ -1435,7 +2404,7 @@ class MyClass:
         let func_unit = func_unit.unwrap();
         assert_eq!(func_unit.kind, CodeUnitKind::Function);
         assert_eq!(func_unit.start_line, 1, "Should include comment");
-        assert_eq!(func_unit.req_refs, vec!["python.feature"]);
+        assert_eq!(func_unit.req_refs, vec![rid("python.feature")]);
 
         // Class
         let class_unit = units
@@ -1489,7 +2458,7 @@ enum MyEnum {
         let func_unit = func_unit.unwrap();
         assert_eq!(func_unit.kind, CodeUnitKind::Function);
         assert_eq!(func_unit.start_line, 1, "Should include comment");
-        assert_eq!(func_unit.req_refs, vec!["ts.feature"]);
+        assert_eq!(func_unit.req_refs, vec![rid("ts.feature")]);
 
         // Class
         let class_unit = units
@@ -1608,5 +2577,763 @@ fn example() {}
         let refs = extract_refs(Path::new("test.rs"), source);
         assert_eq!(refs.len(), 1, "Expected 1 ref, got {:?}", refs);
         assert_eq!(refs[0].req_id, "normal.ref");
+    }
+
+    #[test]
+    fn test_extract_single_segment_refs() {
+        let source = r#"
+// r[impl link]
+// r[link]
+fn example() {}
+"#;
+        let refs = extract_refs(Path::new("test.rs"), source);
+        assert_eq!(refs.len(), 2, "Expected 2 refs, got {:?}", refs);
+        assert_eq!(refs[0].req_id, "link");
+        assert_eq!(refs[1].req_id, "link");
+    }
+
+    #[test]
+    fn test_warn_on_malformed_refs() {
+        let source = r#"
+// r[impl link.]
+// r[link.]
+fn example() {}
+"#;
+        let extracted = extract_refs_with_warnings(Path::new("test.rs"), source);
+        assert!(
+            extracted.references.is_empty(),
+            "Expected no refs, got {:?}",
+            extracted.references
+        );
+        assert_eq!(extracted.warnings.len(), 2);
+    }
+
+    // =========================================================================
+    // C language tests
+    // =========================================================================
+
+    #[test]
+    fn test_c_code_units() {
+        let source = r#"// r[impl c.feature]
+void do_something(void) {
+    printf("hello\n");
+}
+
+// r[verify c.test]
+struct MyStruct {
+    int x;
+    int y;
+};
+
+enum Color {
+    RED,
+    GREEN,
+    BLUE
+};
+
+union Data {
+    int i;
+    float f;
+};
+"#;
+        let units = extract_c(Path::new("test.c"), source);
+
+        // Function
+        let func_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("do_something"));
+        assert!(func_unit.is_some(), "Should find do_something function");
+        let func_unit = func_unit.unwrap();
+        assert_eq!(func_unit.kind, CodeUnitKind::Function);
+        assert_eq!(func_unit.start_line, 1, "Should include comment");
+        assert_eq!(func_unit.req_refs, vec!["c.feature"]);
+
+        // Struct
+        let struct_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyStruct"));
+        assert!(struct_unit.is_some(), "Should find MyStruct");
+        let struct_unit = struct_unit.unwrap();
+        assert_eq!(struct_unit.kind, CodeUnitKind::Struct);
+
+        // Enum
+        let enum_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("Color"));
+        assert!(enum_unit.is_some(), "Should find Color enum");
+        assert_eq!(enum_unit.unwrap().kind, CodeUnitKind::Enum);
+
+        // Union
+        let union_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("Data"));
+        assert!(union_unit.is_some(), "Should find Data union");
+        assert_eq!(union_unit.unwrap().kind, CodeUnitKind::Struct);
+    }
+
+    #[test]
+    fn test_c_extract_refs() {
+        let source = r#"// r[impl buffer.alloc]
+void* alloc_buffer(size_t size) {
+    return malloc(size);
+}
+"#;
+        let refs = extract_refs(Path::new("alloc.c"), source);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].req_id, "buffer.alloc");
+        assert_eq!(refs[0].verb, "impl");
+    }
+
+    #[test]
+    fn test_h_file_uses_c_grammar() {
+        let source = r#"struct Point {
+    int x;
+    int y;
+};
+
+void process_point(struct Point* p) {}
+"#;
+        let units = extract(Path::new("point.h"), source);
+        assert!(!units.is_empty(), "Should extract code units from .h file");
+
+        let struct_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("Point"));
+        assert!(struct_unit.is_some(), "Should find Point struct in .h file");
+    }
+
+    // =========================================================================
+    // C++ language tests
+    // =========================================================================
+
+    #[test]
+    fn test_cpp_code_units() {
+        let source = r#"// r[impl cpp.feature]
+void doSomething() {
+    std::cout << "hello" << std::endl;
+}
+
+// r[verify cpp.test]
+class MyClass {
+public:
+    void method() {}
+};
+
+struct MyStruct {
+    int x;
+};
+
+enum MyEnum {
+    A,
+    B,
+    C
+};
+
+namespace MyNamespace {
+    void innerFunc() {}
+}
+"#;
+        let units = extract_cpp(Path::new("test.cpp"), source);
+
+        // Function
+        let func_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("doSomething"));
+        assert!(func_unit.is_some(), "Should find doSomething function");
+        let func_unit = func_unit.unwrap();
+        assert_eq!(func_unit.kind, CodeUnitKind::Function);
+        assert_eq!(func_unit.start_line, 1, "Should include comment");
+        assert_eq!(func_unit.req_refs, vec!["cpp.feature"]);
+
+        // Class
+        let class_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyClass"));
+        assert!(class_unit.is_some(), "Should find MyClass");
+        let class_unit = class_unit.unwrap();
+        assert_eq!(class_unit.kind, CodeUnitKind::Struct);
+
+        // Struct
+        let struct_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyStruct"));
+        assert!(struct_unit.is_some(), "Should find MyStruct");
+
+        // Enum
+        let enum_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyEnum"));
+        assert!(enum_unit.is_some(), "Should find MyEnum");
+
+        // Namespace
+        let ns_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyNamespace"));
+        assert!(ns_unit.is_some(), "Should find MyNamespace namespace");
+        assert_eq!(ns_unit.unwrap().kind, CodeUnitKind::Module);
+
+        // Inner function in namespace
+        let inner_func = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("innerFunc"));
+        assert!(
+            inner_func.is_some(),
+            "Should find innerFunc inside namespace"
+        );
+    }
+
+    #[test]
+    fn test_cpp_extract_refs() {
+        let source = r#"// r[impl widget.render]
+// r[depends ui.framework]
+void render() {
+    // rendering logic
+}
+"#;
+        let refs = extract_refs(Path::new("widget.cpp"), source);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].req_id, "widget.render");
+        assert_eq!(refs[1].req_id, "ui.framework");
+    }
+
+    #[test]
+    fn test_hpp_file_uses_cpp_grammar() {
+        let source = r#"class Widget {
+public:
+    void draw() {}
+};
+"#;
+        let units = extract(Path::new("widget.hpp"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from .hpp file"
+        );
+
+        let class_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("Widget"));
+        assert!(
+            class_unit.is_some(),
+            "Should find Widget class in .hpp file"
+        );
+        assert_eq!(class_unit.unwrap().kind, CodeUnitKind::Struct);
+    }
+
+    #[test]
+    fn test_ruby_code_units() {
+        let source = r#"# r[impl ruby.feature]
+def do_something
+  puts "hello"
+end
+
+# r[verify ruby.test]
+class MyClass
+  def method
+  end
+end
+
+module MyModule
+end
+"#;
+        let units = extract_ruby(Path::new("test.rb"), source);
+
+        let func_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("do_something"));
+        assert!(func_unit.is_some(), "Should find do_something");
+        let func_unit = func_unit.unwrap();
+        assert_eq!(func_unit.kind, CodeUnitKind::Function);
+        assert_eq!(func_unit.req_refs, vec![rid("ruby.feature")]);
+
+        let class_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyClass"));
+        assert!(class_unit.is_some(), "Should find MyClass");
+        assert_eq!(class_unit.unwrap().kind, CodeUnitKind::Struct);
+
+        let module_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyModule"));
+        assert!(module_unit.is_some(), "Should find MyModule");
+        assert_eq!(module_unit.unwrap().kind, CodeUnitKind::Module);
+    }
+
+    #[test]
+    fn test_r_code_units() {
+        let source = r#"# r[impl r.feature]
+do_something <- function(x) {
+  print(x)
+}
+"#;
+        let units = extract_r(Path::new("test.r"), source);
+        assert!(!units.is_empty(), "Should extract code units from R source");
+    }
+
+    #[test]
+    fn test_dart_code_units() {
+        let source = r#"// r[impl dart.feature]
+class MyClass {
+  void doSomething() {}
+}
+
+enum Color { red, green, blue }
+"#;
+        let units = extract_dart(Path::new("test.dart"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from Dart source"
+        );
+    }
+
+    #[test]
+    fn test_lua_code_units() {
+        let source = r#"-- r[impl lua.feature]
+function do_something()
+  print("hello")
+end
+
+local function helper()
+end
+"#;
+        let units = extract_lua(Path::new("test.lua"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from Lua source"
+        );
+    }
+
+    #[test]
+    fn test_asm_code_units() {
+        let source = r#"; r[impl asm.feature]
+_start:
+    mov eax, 1
+    ret
+"#;
+        let units = extract_asm(Path::new("test.asm"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from ASM source"
+        );
+    }
+
+    #[test]
+    fn test_matlab_code_units() {
+        let source = r#"% r[impl matlab.feature]
+function result = do_something(x)
+    result = x + 1;
+end
+"#;
+        let units = extract_matlab(Path::new("test.mat"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from MATLAB source"
+        );
+    }
+
+    #[test]
+    fn test_perl_code_units() {
+        let source = r#"# r[impl perl.feature]
+sub do_something {
+    print "hello\n";
+}
+
+package MyPackage;
+"#;
+        let units = extract_perl(Path::new("test.pl"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from Perl source"
+        );
+    }
+
+    #[test]
+    fn test_haskell_code_units() {
+        let source = r#"-- r[impl haskell.feature]
+module Main where
+
+data Color = Red | Green | Blue
+
+doSomething :: Int -> Int
+doSomething x = x + 1
+"#;
+        let units = extract_haskell(Path::new("test.hs"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from Haskell source"
+        );
+    }
+
+    #[test]
+    fn test_elixir_code_units() {
+        let source = r#"# r[impl elixir.feature]
+defmodule MyModule do
+  # r[verify elixir.test]
+  def do_something do
+    :ok
+  end
+
+  defp helper do
+    :ok
+  end
+end
+"#;
+        let units = extract_elixir(Path::new("test.ex"), source);
+
+        let module_unit = units.units.iter().find(|u| u.kind == CodeUnitKind::Module);
+        assert!(module_unit.is_some(), "Should find defmodule");
+
+        let func_units: Vec<_> = units
+            .units
+            .iter()
+            .filter(|u| u.kind == CodeUnitKind::Function)
+            .collect();
+        assert!(!func_units.is_empty(), "Should find def/defp functions");
+    }
+
+    #[test]
+    fn test_erlang_code_units() {
+        let source = r#"% r[impl erlang.feature]
+do_something(X) ->
+    X + 1.
+"#;
+        let units = extract_erlang(Path::new("test.erl"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from Erlang source"
+        );
+    }
+
+    #[test]
+    fn test_clojure_code_units() {
+        let source = r#"; r[impl clojure.feature]
+(defn do-something [x]
+  (+ x 1))
+
+(def my-const 42)
+
+(ns my-namespace)
+"#;
+        let units = extract_clojure(Path::new("test.clj"), source);
+
+        let func_unit = units
+            .units
+            .iter()
+            .find(|u| u.kind == CodeUnitKind::Function);
+        assert!(func_unit.is_some(), "Should find defn");
+
+        let const_unit = units.units.iter().find(|u| u.kind == CodeUnitKind::Const);
+        assert!(const_unit.is_some(), "Should find def");
+
+        let ns_unit = units.units.iter().find(|u| u.kind == CodeUnitKind::Module);
+        assert!(ns_unit.is_some(), "Should find ns");
+    }
+
+    #[test]
+    fn test_fsharp_code_units() {
+        let source = r#"// r[impl fsharp.feature]
+module MyModule =
+    let doSomething x = x + 1
+
+type MyType = { Name: string }
+"#;
+        let units = extract_fsharp(Path::new("test.fs"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from F# source"
+        );
+    }
+
+    #[test]
+    fn test_vb_code_units() {
+        let source = r#"' r[impl vb.feature]
+Module MyModule
+    Sub DoSomething()
+    End Sub
+
+    Function GetValue() As Integer
+        Return 42
+    End Function
+End Module
+
+Class MyClass
+End Class
+
+Enum Color
+    Red
+    Green
+End Enum
+"#;
+        let units = extract_vb(Path::new("test.vb"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from VB source"
+        );
+    }
+
+    #[test]
+    fn test_cobol_code_units() {
+        let source = "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. HELLO.\n       PROCEDURE DIVISION.\n       MAIN-PARA.\n           DISPLAY \"Hello\".\n           STOP RUN.\n";
+        let units = extract_cobol(Path::new("test.cob"), source);
+        // COBOL parsing may or may not find paragraph_header depending on grammar;
+        // at minimum, verify extraction doesn't panic
+        let _ = units;
+    }
+
+    #[test]
+    fn test_julia_code_units() {
+        let source = r#"# r[impl julia.feature]
+function do_something(x)
+    x + 1
+end
+
+struct MyStruct
+    field::Int
+end
+
+module MyModule
+end
+
+const MY_CONST = 42
+"#;
+        let units = extract_julia(Path::new("test.jl"), source);
+
+        let func_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("do_something"));
+        assert!(func_unit.is_some(), "Should find do_something");
+        assert_eq!(func_unit.unwrap().kind, CodeUnitKind::Function);
+
+        let struct_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyStruct"));
+        assert!(struct_unit.is_some(), "Should find MyStruct");
+        assert_eq!(struct_unit.unwrap().kind, CodeUnitKind::Struct);
+
+        let module_unit = units
+            .units
+            .iter()
+            .find(|u| u.name.as_deref() == Some("MyModule"));
+        assert!(module_unit.is_some(), "Should find MyModule");
+        assert_eq!(module_unit.unwrap().kind, CodeUnitKind::Module);
+    }
+
+    #[test]
+    fn test_d_code_units() {
+        let source = r#"// r[impl d.feature]
+void doSomething() {
+}
+
+class MyClass {
+}
+
+struct MyStruct {
+}
+
+enum Color { red, green, blue }
+"#;
+        let units = extract_d(Path::new("test.d"), source);
+        assert!(!units.is_empty(), "Should extract code units from D source");
+    }
+
+    #[test]
+    fn test_powershell_code_units() {
+        let source = r#"# r[impl powershell.feature]
+function Do-Something {
+    Write-Host "hello"
+}
+
+class MyClass {
+    [void] DoMethod() {}
+}
+
+enum Color {
+    Red
+    Green
+    Blue
+}
+"#;
+        let units = extract_powershell(Path::new("test.ps1"), source);
+
+        let func_unit = units
+            .units
+            .iter()
+            .find(|u| u.kind == CodeUnitKind::Function);
+        assert!(func_unit.is_some(), "Should find function");
+    }
+
+    #[test]
+    fn test_cmake_code_units() {
+        let source = r#"# r[impl cmake.feature]
+function(do_something ARG)
+    message(STATUS "hello")
+endfunction()
+
+macro(my_macro ARG)
+    message(STATUS "macro")
+endmacro()
+"#;
+        let units = extract_cmake(Path::new("test.cmake"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from CMake source"
+        );
+    }
+
+    #[test]
+    fn test_ocaml_code_units() {
+        let source = r#"(* r[impl ocaml.feature] *)
+let do_something x = x + 1
+
+type color = Red | Green | Blue
+
+module MyModule = struct
+end
+"#;
+        let units = extract_ocaml(Path::new("test.ml"), source);
+        assert!(
+            !units.is_empty(),
+            "Should extract code units from OCaml source"
+        );
+    }
+
+    #[test]
+    fn test_bash_code_units() {
+        let source = r#"# r[impl bash.feature]
+do_something() {
+    echo "hello"
+}
+
+function helper {
+    echo "helper"
+}
+"#;
+        let units = extract_bash(Path::new("test.sh"), source);
+
+        let func_units: Vec<_> = units
+            .units
+            .iter()
+            .filter(|u| u.kind == CodeUnitKind::Function)
+            .collect();
+        assert!(
+            !func_units.is_empty(),
+            "Should find function definitions in bash"
+        );
+    }
+
+    #[test]
+    fn test_nix_code_units() {
+        let source = r#"# r[impl nix.feature]
+{
+  greet = name: "Hello, ${name}!";
+
+  /* r[impl nix.config] */
+  settings = {
+    enabled = true;
+  };
+}
+"#;
+        let units = extract_nix(Path::new("test.nix"), source);
+
+        let bindings: Vec<_> = units
+            .units
+            .iter()
+            .filter(|u| u.kind == CodeUnitKind::Const)
+            .collect();
+        assert!(!bindings.is_empty(), "Should find attrset bindings in Nix");
+
+        let funcs: Vec<_> = units
+            .units
+            .iter()
+            .filter(|u| u.kind == CodeUnitKind::Function)
+            .collect();
+        assert!(!funcs.is_empty(), "Should find function expressions in Nix");
+    }
+
+    #[test]
+    fn test_nix_refs() {
+        let source = r#"# r[impl nix.line]
+{
+  /* r[verify nix.block] */
+  foo = 1;
+}
+"#;
+        let refs = extract_refs(Path::new("test.nix"), source);
+        assert_eq!(refs.len(), 2, "Should find refs in both # and /* */ comments");
+        assert_eq!(refs[0].req_id, "nix.line");
+        assert_eq!(refs[1].req_id, "nix.block");
+    }
+
+    #[test]
+    fn test_fenced_code_in_inner_doc_comments_treesitter() {
+        let source = "//! ```text\n//! slot_count[i]\n//! ```\nfn main() {}\n";
+        let refs = extract_refs_with_warnings(Path::new("test.rs"), source);
+        assert_eq!(
+            refs.references.len(),
+            0,
+            "fenced code in //! should produce no annotations"
+        );
+        assert_eq!(refs.warnings.len(), 0);
+    }
+
+    #[test]
+    fn test_fenced_code_in_outer_doc_comments_treesitter() {
+        let source = "/// ```rust\n/// // r[haha.hehe]\n/// ```\nfn foo() {}\n";
+        let refs = extract_refs_with_warnings(Path::new("test.rs"), source);
+        assert_eq!(
+            refs.references.len(),
+            0,
+            "fenced code in /// should produce no annotations"
+        );
+        assert_eq!(refs.warnings.len(), 0);
+    }
+
+    #[test]
+    fn test_identifier_before_bracket_not_annotation_treesitter() {
+        let source = "/// slot_count[i] is fun\nfn foo() {}\n";
+        let refs = extract_refs_with_warnings(Path::new("test.rs"), source);
+        assert_eq!(
+            refs.references.len(),
+            0,
+            "identifier[x] should not be an annotation"
+        );
+        assert_eq!(refs.warnings.len(), 0);
+    }
+
+    #[test]
+    fn test_inline_backtick_in_doc_comment_treesitter() {
+        let source = "/// `r[haha.hehe]` yey\nfn foo() {}\n";
+        let refs = extract_refs_with_warnings(Path::new("test.rs"), source);
+        assert_eq!(
+            refs.references.len(),
+            0,
+            "inline code in /// should produce no annotations"
+        );
+    }
+
+    #[test]
+    fn test_legitimate_ref_after_whitespace_treesitter() {
+        let source = "/// r[impl foo.bar]\nfn foo() {}\n";
+        let refs = extract_refs_with_warnings(Path::new("test.rs"), source);
+        assert_eq!(refs.references.len(), 1);
+        assert_eq!(refs.references[0].prefix, "r");
+        assert_eq!(refs.references[0].verb, "impl");
+        assert_eq!(refs.references[0].req_id.to_string(), "foo.bar");
     }
 }

@@ -4,9 +4,11 @@
 //! and embedding purposes.
 
 pub mod bridge;
+pub mod bump;
 pub mod config;
 pub mod daemon;
 pub mod data;
+pub(crate) mod rule_suggestions;
 pub mod search;
 pub mod server;
 pub mod vite;
@@ -20,9 +22,12 @@ use tracey_core::ReqDefinition;
 use marq::{RenderOptions, render};
 
 /// Extracted rule with source location info
+#[derive(Clone)]
 pub struct ExtractedRule {
     pub def: ReqDefinition,
     pub source_file: String,
+    /// Marker prefix used by this requirement definition (e.g., "r" in `r[foo.bar]`)
+    pub prefix: String,
     /// 1-indexed column where the rule marker starts
     pub column: Option<usize>,
     /// Section slug (heading ID) that this rule belongs to
@@ -40,10 +45,22 @@ fn compute_column(content: &str, byte_offset: usize) -> usize {
     before[line_start..].chars().count() + 1
 }
 
+fn extract_marker_prefix(content: &str, marker_span: marq::SourceSpan) -> Option<String> {
+    let start = marker_span.offset;
+    let end = start.checked_add(marker_span.length)?;
+    let marker = content.get(start..end)?;
+    let bracket = marker.find('[')?;
+    let prefix = marker[..bracket].trim();
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(prefix.to_string())
+}
+
 /// Load rules from markdown files matching a glob pattern.
 ///
 /// marq implements markdown rule extraction:
-/// r[impl markdown.syntax.marker]
+/// r[impl markdown.syntax.marker+2]
 /// r[impl markdown.syntax.inline-ignored]
 pub async fn load_rules_from_glob(
     root: &std::path::Path,
@@ -100,6 +117,10 @@ pub async fn load_rules_from_glob(
         .git_ignore(true)
         .build();
 
+    let glob_matcher = globset::Glob::new(&effective_pattern)
+        .map(|g| g.compile_matcher())
+        .map_err(|e| eyre::eyre!("Invalid glob pattern '{}': {}", effective_pattern, e))?;
+
     for entry in walker {
         let entry = entry?;
         let path = entry.path();
@@ -123,7 +144,7 @@ pub async fn load_rules_from_glob(
             relative_str.clone()
         };
 
-        if !matches_glob(&relative_str, &effective_pattern) {
+        if !glob_matcher.is_match(relative) {
             continue;
         }
 
@@ -149,14 +170,15 @@ pub async fn load_rules_from_glob(
             // r[impl markdown.duplicates.same-file] - caught when marq returns duplicate reqs from single file
             // r[impl markdown.duplicates.cross-file] - caught via seen_ids persisting across files
             for req in &doc.reqs {
-                if seen_ids.contains(&req.id) {
+                let req_id = req.id.to_string();
+                if seen_ids.contains(&req_id) {
                     eyre::bail!(
                         "Duplicate requirement '{}' found in {}",
                         req.id.red(),
                         display_path
                     );
                 }
-                seen_ids.insert(req.id.clone());
+                seen_ids.insert(req_id);
             }
 
             // Build a mapping from rule ID to section info by processing elements in order
@@ -173,8 +195,10 @@ pub async fn load_rules_from_glob(
                     }
                     DocElement::Req(r) => {
                         if let Some((slug, title)) = &current_section {
-                            rule_sections
-                                .insert(r.id.clone(), (Some(slug.clone()), Some(title.clone())));
+                            rule_sections.insert(
+                                r.id.to_string(),
+                                (Some(slug.clone()), Some(title.clone())),
+                            );
                         }
                     }
                     DocElement::Paragraph(_) => {}
@@ -184,11 +208,20 @@ pub async fn load_rules_from_glob(
             // Add requirements with their source file, computed column, and section
             for req in doc.reqs {
                 let column = Some(compute_column(&content, req.span.offset));
-                let (section, section_title) =
-                    rule_sections.remove(&req.id).unwrap_or((None, None));
+                let prefix = extract_marker_prefix(&content, req.marker_span).ok_or_else(|| {
+                    eyre::eyre!(
+                        "Failed to determine requirement marker prefix in {} at line {}",
+                        display_path,
+                        req.line
+                    )
+                })?;
+                let (section, section_title) = rule_sections
+                    .remove(&req.id.to_string())
+                    .unwrap_or((None, None));
                 rules.push(ExtractedRule {
                     def: req,
                     source_file: display_path.clone(),
+                    prefix,
                     column,
                     section,
                     section_title,
@@ -218,14 +251,15 @@ pub async fn load_rules_from_globs(
         // r[impl validation.duplicates]
         // Check for duplicates across patterns
         for extracted in rules {
-            if seen_ids.contains(&extracted.def.id) {
+            let def_id = extracted.def.id.to_string();
+            if seen_ids.contains(&def_id) {
                 eyre::bail!(
                     "Duplicate requirement '{}' found in {}",
                     extracted.def.id.red(),
                     extracted.source_file
                 );
             }
-            seen_ids.insert(extracted.def.id.clone());
+            seen_ids.insert(def_id);
             all_rules.push(extracted);
         }
     }
@@ -233,63 +267,23 @@ pub async fn load_rules_from_globs(
     Ok(all_rules)
 }
 
-/// Simple glob pattern matching
-fn matches_glob(path: &str, pattern: &str) -> bool {
-    // Make path separators consistent in case of windows
-    let path = path.replace('\\', "/");
-    let pattern = pattern.replace('\\', "/");
-
-    // Handle **/*.md pattern
-    if pattern == "**/*.md" {
-        return path.ends_with(".md");
-    }
-
-    // Handle prefix/**/*.md patterns like "docs/**/*.md"
-    if let Some(rest) = pattern.strip_suffix("/**/*.md") {
-        return path.starts_with(rest) && path.ends_with(".md");
-    }
-
-    // Handle prefix/** patterns
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path.starts_with(prefix);
-    }
-
-    // Handle exact matches
-    if !pattern.contains('*') {
-        return path == pattern;
-    }
-
-    // Fallback: simple contains check for the non-wildcard parts
-    let parts: Vec<&str> = pattern.split('*').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() {
-        return true;
-    }
-
-    let mut remaining = path.as_str();
-    for part in parts {
-        if let Some(idx) = remaining.find(part) {
-            remaining = &remaining[idx + part.len()..];
-        } else {
-            return false;
+/// Walk upward from `start` looking for a directory containing a `Cargo.toml`.
+/// Falls back to `start` itself if none is found.
+pub fn find_project_root_from(start: &std::path::Path) -> PathBuf {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join("Cargo.toml").exists() {
+            return current;
+        }
+        if !current.pop() {
+            return start.to_path_buf();
         }
     }
-
-    true
 }
 
 pub fn find_project_root() -> Result<PathBuf> {
-    let mut current = std::env::current_dir()?;
-
-    loop {
-        if current.join("Cargo.toml").exists() {
-            return Ok(current);
-        }
-
-        if !current.pop() {
-            // No Cargo.toml found, use current directory
-            return std::env::current_dir().wrap_err("Failed to get current directory");
-        }
-    }
+    let cwd = std::env::current_dir().wrap_err("Failed to get current directory")?;
+    Ok(find_project_root_from(&cwd))
 }
 
 pub fn load_config(path: &PathBuf) -> Result<Config> {
@@ -300,7 +294,6 @@ pub fn load_config(path: &PathBuf) -> Result<Config> {
              specs (\n  \
                {{\n    \
                  name my-spec\n    \
-                 prefix r\n    \
                  include (docs/**/*.md)\n    \
                  impls (\n      \
                    {{\n        \

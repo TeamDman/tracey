@@ -1,17 +1,43 @@
 //! Build script for tracey - generates code and builds the dashboard
 
 use std::fs;
+use std::ffi::OsString;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+use time::OffsetDateTime;
+use time::format_description::well_known::Iso8601;
 
 /// Creates a Command that will work cross-platform.
-/// On Windows, runs through `cmd /c` to handle PATH resolution for .cmd/.ps1/.exe variants.
+/// On Windows, resolves commands first so executables run directly and `.cmd`/`.bat`
+/// shims still work without relying on `cmd.exe` PATH lookup against Cargo's full PATH.
 /// On Unix, runs the command directly.
 fn shell_command(program: &str) -> Command {
     #[cfg(windows)]
     {
+        if let Some(path) = resolve_windows_command(program) {
+            let extension = command_extension(&path);
+
+            if matches!(extension.as_deref(), Some("cmd" | "bat")) {
+                let mut cmd = Command::new("cmd.exe");
+                cmd.args(["/d", "/c"]);
+                cmd.arg(path);
+                if let Some(path) = windows_shell_path() {
+                    cmd.env("PATH", path);
+                }
+                return cmd;
+            }
+
+            if matches!(extension.as_deref(), Some("exe" | "com")) {
+                return Command::new(path);
+            }
+        }
+
         let mut cmd = Command::new("cmd.exe");
-        cmd.args(["/c", program]);
+        cmd.args(["/d", "/c", program]);
+        if let Some(path) = windows_shell_path() {
+            cmd.env("PATH", path);
+        }
         cmd
     }
     #[cfg(not(windows))]
@@ -20,7 +46,57 @@ fn shell_command(program: &str) -> Command {
     }
 }
 
+#[cfg(windows)]
+fn command_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
+#[cfg(windows)]
+fn resolve_windows_command(program: &str) -> Option<PathBuf> {
+    which::which(program)
+        .ok()
+        .and_then(|path| {
+            let extension = command_extension(&path);
+            matches!(extension.as_deref(), Some("exe" | "com" | "cmd" | "bat")).then_some(path)
+        })
+        .or_else(|| which::which(format!("{program}.cmd")).ok())
+        .or_else(|| which::which(format!("{program}.bat")).ok())
+}
+
+#[cfg(windows)]
+fn windows_shell_path() -> Option<OsString> {
+    let mut paths = Vec::<PathBuf>::new();
+
+    for program in ["node", "npm", "npm.cmd", "pnpm", "pnpm.cmd"] {
+        if let Some(path) = resolve_windows_command(program)
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+        {
+            if !paths.iter().any(|existing| existing == &path) {
+                paths.push(path);
+            }
+        }
+    }
+
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        let system_root = PathBuf::from(system_root);
+        let system32 = system_root.join("System32");
+
+        if !paths.iter().any(|existing| existing == &system32) {
+            paths.push(system32);
+        }
+        if !paths.iter().any(|existing| existing == &system_root) {
+            paths.push(system_root);
+        }
+    }
+
+    std::env::join_paths(paths).ok()
+}
+
 fn main() {
+    emit_tracey_version_metadata();
+
     // Generate Styx schema for config (embedded in binary for tooling discovery)
     generate_styx_schema();
 
@@ -29,6 +105,79 @@ fn main() {
 
     // Build dashboard (after TS types are generated)
     build_dashboard();
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = shell_command(program);
+    cmd.args(args);
+    cmd.output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn format_utc_date(date_time: OffsetDateTime) -> Option<String> {
+    date_time
+        .format(&Iso8601::DATE)
+        .ok()
+        .map(|value| value.to_string())
+}
+
+fn source_date_epoch() -> Option<String> {
+    let epoch = env_var("SOURCE_DATE_EPOCH")?;
+
+    // Zip-based packagers sometimes set the DOS epoch sentinel (1980-01-01),
+    // which is not meaningful build metadata for users.
+    if epoch == "315532800" {
+        return None;
+    }
+
+    let timestamp = epoch.parse::<i64>().ok()?;
+    let date_time = OffsetDateTime::from_unix_timestamp(timestamp).ok()?;
+    format_utc_date(date_time)
+}
+
+fn emit_tracey_version_metadata() {
+    let git_commit = command_output("git", &["rev-parse", "--short=12", "HEAD"]).or_else(|| {
+        [
+            "TRACEY_GIT_COMMIT",
+            "GITHUB_SHA",
+            "CI_COMMIT_SHA",
+            "SOURCE_COMMIT",
+        ]
+        .iter()
+        .find_map(|name| env_var(name))
+        .map(|commit| commit.chars().take(12).collect::<String>())
+    });
+
+    if let Some(git_commit) = git_commit {
+        println!("cargo:rustc-env=TRACEY_GIT_COMMIT={git_commit}");
+    }
+
+    let build_date = env_var("TRACEY_BUILD_DATE")
+        .or_else(source_date_epoch)
+        .or_else(|| {
+            command_output(
+                "git",
+                &[
+                    "show",
+                    "-s",
+                    "--date=format:%Y-%m-%d",
+                    "--format=%cd",
+                    "HEAD",
+                ],
+            )
+        })
+        .or_else(|| format_utc_date(OffsetDateTime::now_utc()));
+
+    if let Some(build_date) = build_date {
+        println!("cargo:rustc-env=TRACEY_BUILD_DATE={build_date}");
+    }
 }
 
 fn generate_styx_schema() {
@@ -89,23 +238,39 @@ fn generate_typescript_types() {
     }
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("Failed to create directory");
+    for entry in fs::read_dir(src).expect("Failed to read directory") {
+        let entry = entry.expect("Failed to read entry");
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip node_modules and dist — those belong in OUT_DIR only
+        if name_str == "node_modules" || name_str == "dist" {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path);
+        } else {
+            fs::copy(&src_path, &dst_path).expect("Failed to copy file");
+        }
+    }
+}
+
 fn build_dashboard() {
-    // Dashboard is colocated with the HTTP bridge
-    let dashboard_dir = Path::new("src/bridge/http/dashboard");
-    let dist_dir = dashboard_dir.join("dist");
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let dashboard_src = Path::new("src/bridge/http/dashboard");
+    let dashboard_out = Path::new(&out_dir).join("dashboard");
+    let dist_dir = dashboard_out.join("dist");
 
     // Re-run if dashboard source changes
     println!("cargo:rerun-if-changed=src/bridge/http/dashboard/src");
     println!("cargo:rerun-if-changed=src/bridge/http/dashboard/index.html");
     println!("cargo:rerun-if-changed=src/bridge/http/dashboard/package.json");
     println!("cargo:rerun-if-changed=src/bridge/http/dashboard/vite.config.ts");
-    // Re-run if output is missing (so deleting dist triggers rebuild)
-    println!("cargo:rerun-if-changed=src/bridge/http/dashboard/dist/index.html");
-    println!("cargo:rerun-if-changed=src/bridge/http/dashboard/dist/assets/index.js");
-    println!("cargo:rerun-if-changed=src/bridge/http/dashboard/dist/assets/index.css");
 
-    // Skip build if dist already exists (for faster incremental builds)
-    // To force rebuild, delete the dist directory
+    // Skip build if dist already exists in OUT_DIR (for faster incremental builds)
     if dist_dir.join("index.html").exists()
         && dist_dir.join("assets/index.js").exists()
         && dist_dir.join("assets/index.css").exists()
@@ -113,114 +278,118 @@ fn build_dashboard() {
         return;
     }
 
-    // Check if node is available
-    let node_check = shell_command("node").arg("--version").output();
+    // Copy dashboard source into OUT_DIR so pnpm/vite run entirely outside the source tree
+    copy_dir_recursive(dashboard_src, &dashboard_out);
+    let dashboard_dir = &dashboard_out;
 
-    match node_check {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            eprintln!("Found node {}", version.trim());
-        }
-        _ => {
-            #[cfg(windows)]
-            panic!(
-                "\n\
-                Node.js is required but not found!\n\
-                \n\
-                Install Node.js using Chocolatey:\n\
-                \n\
-                  # First, install Chocolatey (if not already installed):\n\
-                  powershell -c \"irm https://community.chocolatey.org/install.ps1|iex\"\n\
-                \n\
-                  # Then install Node.js:\n\
-                  choco install nodejs\n\
-                \n\
-                  # Verify installation:\n\
-                  node -v\n\
-                \n\
-                See https://nodejs.org/en/download for more options.\n"
-            );
+        // Check if node is available
+        let node_check = shell_command("node").arg("--version").output();
 
-            #[cfg(not(windows))]
-            panic!(
-                "\n\
-                Node.js is required but not found!\n\
-                \n\
-                Install Node.js using one of the following methods:\n\
-                \n\
-                  # On macOS with Homebrew:\n\
-                  brew install node\n\
-                \n\
-                  # Using fnm (Fast Node Manager):\n\
-                  curl -fsSL https://fnm.vercel.app/install | bash\n\
-                  fnm install --lts\n\
-                \n\
-                  # Using nvm (Node Version Manager):\n\
-                  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash\n\
-                  nvm install --lts\n\
-                \n\
-                See https://nodejs.org/en/download for more options.\n"
-            );
+        match node_check {
+                Ok(output) if output.status.success() => {
+                        let version = String::from_utf8_lossy(&output.stdout);
+                        eprintln!("Found node {}", version.trim());
+                }
+                _ => {
+                        #[cfg(windows)]
+                        panic!(
+                                "\n\
+                                Node.js is required but not found!\n\
+                                \n\
+                                Install Node.js using Chocolatey:\n\
+                                \n\
+                                    # First, install Chocolatey (if not already installed):\n\
+                                    powershell -c \"irm https://community.chocolatey.org/install.ps1|iex\"\n\
+                                \n\
+                                    # Then install Node.js:\n\
+                                    choco install nodejs\n\
+                                \n\
+                                    # Verify installation:\n\
+                                    node -v\n\
+                                \n\
+                                See https://nodejs.org/en/download for more options.\n"
+                        );
+
+                        #[cfg(not(windows))]
+                        panic!(
+                                "\n\
+                                Node.js is required but not found!\n\
+                                \n\
+                                Install Node.js using one of the following methods:\n\
+                                \n\
+                                    # On macOS with Homebrew:\n\
+                                    brew install node\n\
+                                \n\
+                                    # Using fnm (Fast Node Manager):\n\
+                                    curl -fsSL https://fnm.vercel.app/install | bash\n\
+                                    fnm install --lts\n\
+                                \n\
+                                    # Using nvm (Node Version Manager):\n\
+                                    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash\n\
+                                    nvm install --lts\n\
+                                \n\
+                                See https://nodejs.org/en/download for more options.\n"
+                        );
+                }
         }
-    }
 
     // Check if pnpm is available
     let pnpm_check = shell_command("pnpm").arg("version").output();
 
-    match pnpm_check {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            eprintln!("Found pnpm {}", version.trim());
-        }
-        _ => {
-            #[cfg(windows)]
-            panic!(
-                "\n\
-                pnpm is required but not found!\n\
-                \n\
-                Install pnpm using one of the following methods:\n\
-                \n\
-                  # Using npm (recommended):\n\
-                  npm install -g pnpm\n\
-                \n\
-                  # Using Chocolatey:\n\
-                  choco install pnpm\n\
-                \n\
-                  # Using winget:\n\
-                  winget install -e --id pnpm.pnpm\n\
-                \n\
-                  # Using Scoop:\n\
-                  scoop install pnpm\n\
-                \n\
-                  # Verify installation:\n\
-                  pnpm -v\n\
-                \n\
-                See https://pnpm.io/installation for more options.\n"
-            );
+        match pnpm_check {
+                Ok(output) if output.status.success() => {
+                        let version = String::from_utf8_lossy(&output.stdout);
+                        eprintln!("Found pnpm {}", version.trim());
+                }
+                _ => {
+                        #[cfg(windows)]
+                        panic!(
+                                "\n\
+                                pnpm is required but not found!\n\
+                                \n\
+                                Install pnpm using one of the following methods:\n\
+                                \n\
+                                    # Using npm (recommended):\n\
+                                    npm install -g pnpm\n\
+                                \n\
+                                    # Using Chocolatey:\n\
+                                    choco install pnpm\n\
+                                \n\
+                                    # Using winget:\n\
+                                    winget install -e --id pnpm.pnpm\n\
+                                \n\
+                                    # Using Scoop:\n\
+                                    scoop install pnpm\n\
+                                \n\
+                                    # Verify installation:\n\
+                                    pnpm -v\n\
+                                \n\
+                                See https://pnpm.io/installation for more options.\n"
+                        );
 
-            #[cfg(not(windows))]
-            panic!(
-                "\n\
-                pnpm is required but not found!\n\
-                \n\
-                Install pnpm using one of the following methods:\n\
-                \n\
-                  # Using Corepack (recommended, included with Node.js 16.13+):\n\
-                  corepack enable pnpm\n\
-                \n\
-                  # Using npm:\n\
-                  npm install -g pnpm\n\
-                \n\
-                  # On macOS with Homebrew:\n\
-                  brew install pnpm\n\
-                \n\
-                  # Standalone script:\n\
-                  curl -fsSL https://get.pnpm.io/install.sh | sh -\n\
-                \n\
-                See https://pnpm.io/installation for more options.\n"
-            );
+                        #[cfg(not(windows))]
+                        panic!(
+                                "\n\
+                                pnpm is required but not found!\n\
+                                \n\
+                                Install pnpm using one of the following methods:\n\
+                                \n\
+                                    # Using Corepack (recommended, included with Node.js 16.13+):\n\
+                                    corepack enable pnpm\n\
+                                \n\
+                                    # Using npm:\n\
+                                    npm install -g pnpm\n\
+                                \n\
+                                    # On macOS with Homebrew:\n\
+                                    brew install pnpm\n\
+                                \n\
+                                    # Standalone script:\n\
+                                    curl -fsSL https://get.pnpm.io/install.sh | sh -\n\
+                                \n\
+                                See https://pnpm.io/installation for more options.\n"
+                        );
+                }
         }
-    }
 
     eprintln!("Building dashboard with pnpm...");
 
@@ -240,7 +409,7 @@ fn build_dashboard() {
         panic!("pnpm install failed");
     }
 
-    // Build the dashboard
+    // Build the dashboard (output goes to OUT_DIR/dashboard/dist)
     let status = shell_command("pnpm")
         .args(["run", "build"])
         .current_dir(dashboard_dir)

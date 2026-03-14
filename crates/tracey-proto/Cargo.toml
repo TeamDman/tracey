@@ -1,7 +1,10 @@
 [package]
 name = "tracey-proto"
-version = "1.0.0"
-description = "Protocol definitions for tracey daemon RPC"
+version.workspace = true
+description = "Protocol definitions for the tracey spec coverage daemon RPC"
+keywords = ["specification", "coverage", "traceability", "rpc", "tracey"]
+categories = ["development-tools"]
+readme = "../../README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,10 +17,11 @@ rustdoc-args = ["--html-in-header", "arborium-header.html"]
 
 [dependencies]
 # roam RPC framework
-roam = { git = "https://github.com/bearcove/roam", branch = "main" }
+roam = { workspace = true }
 
 # API types (re-exported for convenience)
-tracey-api = { path = "../tracey-api" }
+tracey-api = { workspace = true }
+tracey-core = { workspace = true }
 
 # facet for Facet derives on request/response types
 facet = { workspace = true }

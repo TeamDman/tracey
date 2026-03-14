@@ -1,7 +1,10 @@
 [package]
 name = "tracey-api"
-version = "1.0.0"
-description = "API types for tracey dashboard"
+version.workspace = true
+description = "API types for the tracey spec coverage dashboard"
+keywords = ["specification", "coverage", "traceability", "api", "tracey"]
+categories = ["development-tools"]
+readme = "../../README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,3 +17,4 @@ rustdoc-args = ["--html-in-header", "arborium-header.html"]
 
 [dependencies]
 facet = { workspace = true }
+tracey-core = { workspace = true, default-features = false }

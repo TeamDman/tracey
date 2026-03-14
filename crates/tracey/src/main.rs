@@ -4,10 +4,12 @@
 //! (in the format `[rule.id]` in comments) and compares them against a spec
 //! manifest to produce coverage reports.
 
-use eyre::Result;
-use facet_args as args;
+use eyre::{Result, WrapErr, eyre};
+use figue::{self as args, FigueBuiltins};
 use owo_colors::OwoColorize;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 
 // Use the library crate
 use tracey::{bridge, daemon, find_project_root};
@@ -15,13 +17,13 @@ use tracey::{bridge, daemon, find_project_root};
 /// CLI arguments
 #[derive(Debug, facet::Facet)]
 struct Args {
-    /// Print version information
-    #[facet(args::named, args::short = 'V', default)]
-    version: bool,
-
     /// Subcommand to run
     #[facet(args::subcommand)]
-    command: Option<Command>,
+    command: Command,
+
+    /// Standard CLI builtins (--help, --version, --completions)
+    #[facet(flatten)]
+    builtins: FigueBuiltins,
 }
 
 /// Subcommands
@@ -104,6 +106,10 @@ enum Command {
         /// Project root directory (default: current directory)
         #[facet(args::positional, default)]
         root: Option<PathBuf>,
+
+        /// Output raw JSON instead of human-readable text
+        #[facet(args::named, default)]
+        json: bool,
     },
 
     /// Stop the running daemon
@@ -112,134 +118,721 @@ enum Command {
         #[facet(args::positional, default)]
         root: Option<PathBuf>,
     },
+
+    /// Manage the bundled AI skill
+    Skill {
+        /// Skill action to perform
+        #[facet(args::subcommand)]
+        action: SkillAction,
+    },
+
+    /// Configure AI assistants (register MCP + install bundled skill)
+    Ai {
+        /// Configure only Claude Code
+        #[facet(args::named, default)]
+        claude: bool,
+
+        /// Configure only Codex CLI
+        #[facet(args::named, default)]
+        codex: bool,
+    },
+
+    /// Run query subcommands over daemon data from the terminal
+    Query {
+        /// Project root directory (default: current directory)
+        #[facet(args::positional, default)]
+        root: Option<PathBuf>,
+
+        /// Output raw JSON instead of human-readable text
+        #[facet(args::named, default)]
+        json: bool,
+
+        /// Query command to run
+        #[facet(args::subcommand)]
+        query: QueryCommand,
+    },
+
+    /// Check staged spec changes and fail if any rule text changed without a version bump.
+    /// Designed to be installed as a git pre-commit hook.
+    PreCommit {
+        /// Project root directory (default: current directory)
+        #[facet(args::positional, default)]
+        root: Option<PathBuf>,
+
+        /// Path to config file
+        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.styx")]
+        config: PathBuf,
+    },
+
+    /// Bump version numbers of staged rules whose text changed, then re-stage the files.
+    Bump {
+        /// Project root directory (default: current directory)
+        #[facet(args::positional, default)]
+        root: Option<PathBuf>,
+
+        /// Path to config file
+        #[facet(args::named, args::short = 'c', default = ".config/tracey/config.styx")]
+        config: PathBuf,
+    },
+
+    /// Remove orphaned state directories whose projects no longer exist on disk
+    Gc {
+        /// Show what would be removed without deleting anything
+        #[facet(rename = "dry-run", args::named, default)]
+        dry_run: bool,
+    },
+}
+
+/// Skill subcommands
+#[derive(Debug, facet::Facet)]
+#[repr(u8)]
+enum SkillAction {
+    /// Install the bundled Tracey skill for Claude and/or Codex
+    Install {
+        /// Install only for Claude Code
+        #[facet(args::named, default)]
+        claude: bool,
+
+        /// Install only for Codex CLI
+        #[facet(args::named, default)]
+        codex: bool,
+    },
+}
+
+#[derive(Debug, facet::Facet)]
+#[repr(u8)]
+enum QueryCommand {
+    /// coverage overview
+    Status,
+
+    /// List rules without implementation references
+    Uncovered {
+        /// Spec/impl to query (e.g., "my-spec/rust"). Optional if only one exists.
+        #[facet(args::named, default)]
+        spec_impl: Option<String>,
+
+        /// Filter by rule ID prefix
+        #[facet(args::named, default)]
+        prefix: Option<String>,
+    },
+
+    /// List rules without verification references
+    Untested {
+        /// Spec/impl to query (e.g., "my-spec/rust"). Optional if only one exists.
+        #[facet(args::named, default)]
+        spec_impl: Option<String>,
+
+        /// Filter by rule ID prefix
+        #[facet(args::named, default)]
+        prefix: Option<String>,
+    },
+
+    /// Show unmapped code units
+    Unmapped {
+        /// Spec/impl to query (e.g., "my-spec/rust"). Optional if only one exists.
+        #[facet(args::named, default)]
+        spec_impl: Option<String>,
+
+        /// Directory or file path to zoom into
+        #[facet(args::named, default)]
+        path: Option<String>,
+    },
+
+    /// List stale references (code pointing to older rule versions)
+    Stale {
+        /// Spec/impl to query (e.g., "my-spec/rust"). Optional if only one exists.
+        #[facet(args::named, default)]
+        spec_impl: Option<String>,
+
+        /// Filter by rule ID prefix
+        #[facet(args::named, default)]
+        prefix: Option<String>,
+    },
+
+    /// Show details about one or more rules
+    Rule {
+        /// Rule identifiers to inspect (one or more)
+        #[facet(args::positional)]
+        rule_ids: Vec<String>,
+    },
+
+    /// Display current configuration
+    Config,
+
+    /// Validate the spec and implementation
+    Validate {
+        /// Spec/impl to validate (e.g., "my-spec/rust"). Optional if only one exists.
+        #[facet(args::named, default)]
+        spec_impl: Option<String>,
+
+        /// Diagnostics to deny as fatal (repeatable). Supported values: warnings.
+        #[facet(args::named, default)]
+        deny: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ValidationDeny {
+    warnings: bool,
+}
+
+impl ValidationDeny {
+    fn parse(values: &[String]) -> Result<Self> {
+        let mut deny = Self::default();
+        for raw in values {
+            for token in raw.split(',') {
+                let token = token.trim().to_ascii_lowercase();
+                if token.is_empty() {
+                    continue;
+                }
+                match token.as_str() {
+                    "warnings" | "warning" => deny.warnings = true,
+                    other => {
+                        return Err(eyre!(
+                            "unknown value for --deny: {other} (supported: warnings)"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(deny)
+    }
+
+    fn should_fail(self, error_count: usize, warning_count: usize) -> bool {
+        error_count > 0 || (self.warnings && warning_count > 0)
+    }
 }
 
 // Embed the config schema for zero-execution discovery by styx tooling
 styx_embed::embed_outdir_file!("schema.styx");
 
-fn main() -> Result<()> {
-    let args: Args = match args::from_std_args() {
-        Ok(args) => args,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1)
-        }
-    };
-
-    if args.version {
-        println!("tracey {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+#[tokio::main]
+async fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.first().map(|s| s.as_str()) == Some("mcp")
+        && raw_args.get(1).map(|s| s.as_str()) == Some("register")
+    {
+        return register_mcp_clients(&raw_args[2..]);
     }
+
+    let config = args::builder::<Args>()
+        .map_err(|e| eyre!("failed to initialize CLI parser: {e:?}"))?
+        .cli(|cli| cli.args(raw_args.clone().into_iter()))
+        .help(|h| {
+            h.program_name(env!("CARGO_PKG_NAME"))
+                .version(cli_version_text())
+        })
+        .build();
+    let args: Args = args::Driver::new(config).run().unwrap();
 
     match args.command {
         // r[impl cli.web]
         // r[impl daemon.cli.web]
-        Some(Command::Web {
+        Command::Web {
             root,
             config,
             port,
             open,
             dev,
-        }) => {
-            init_tracing(TracingConfig { log_file: None })?;
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(bridge::http::run(
-                root,
-                config,
-                port.unwrap_or(3000),
-                open,
-                dev,
-            ))
+        } => {
+            init_tracing(TracingConfig {
+                log_file: None,
+                enable_console: true,
+                console_ansi: true,
+                default_filter: "tracey=info",
+            })?;
+            bridge::http::run(root, config, port, open, dev).await
         }
         // r[impl cli.mcp]
         // r[impl daemon.cli.mcp]
-        Some(Command::Mcp { root, config }) => {
-            // MCP communicates over stdio, so no tracing to stdout
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(bridge::mcp::run(root, config))
+        Command::Mcp { root, config } => {
+            let project_root = root.unwrap_or_else(|| find_project_root().unwrap_or_default());
+            let log_path = bridge_log_path(&project_root, "mcp");
+            write_bridge_start_marker(&log_path, "mcp", &project_root, &config)?;
+            // MCP communicates over stdio, so logging must stay off stdio.
+            init_tracing(TracingConfig {
+                log_file: Some(log_path.clone()),
+                enable_console: false,
+                console_ansi: false,
+                default_filter: "tracey=info",
+            })?;
+            tracing::info!(
+                pid = std::process::id(),
+                command = "mcp",
+                project_root = %project_root.display(),
+                config = %config.display(),
+                log_file = %log_path.display(),
+                "starting tracey bridge"
+            );
+            bridge::mcp::run(Some(project_root), config).await
         }
         // r[impl daemon.cli.lsp]
-        Some(Command::Lsp { root, config }) => {
-            // LSP communicates over stdio, so no tracing to stdout
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(bridge::lsp::run(root, config))
+        Command::Lsp { root, config } => {
+            let project_root = root.unwrap_or_else(|| find_project_root().unwrap_or_default());
+            // LSP uses stdout for the wire protocol, so logs go to stderr.
+            init_tracing(TracingConfig {
+                log_file: None,
+                enable_console: true,
+                console_ansi: false,
+                default_filter: "tracey=debug",
+            })?;
+            tracing::info!(
+                pid = std::process::id(),
+                command = "lsp",
+                project_root = %project_root.display(),
+                config = %config.display(),
+                "starting tracey bridge"
+            );
+            bridge::lsp::run(Some(project_root), config).await
         }
         // r[impl daemon.cli.daemon]
-        Some(Command::Daemon { root, config }) => {
+        Command::Daemon { root, config } => {
             let project_root = root.unwrap_or_else(|| find_project_root().unwrap_or_default());
             // r[impl config.path.default]
             let config_path = project_root.join(&config);
 
             // r[impl daemon.logs.file]
-            let log_path = project_root.join(".tracey/daemon.log");
+            daemon::ensure_state_dir(&project_root)?;
+            let log_path = daemon::state_dir(&project_root).join("daemon.log");
             init_tracing(TracingConfig {
                 log_file: Some(log_path),
+                enable_console: true,
+                console_ansi: true,
+                default_filter: "tracey=info",
             })?;
 
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(daemon::run(project_root, config_path))
+            daemon::run(project_root, config_path).await
         }
         // r[impl daemon.cli.logs]
-        Some(Command::Logs {
+        Command::Logs {
             root,
             follow,
             lines,
-        }) => show_logs(root, follow, lines.unwrap_or(50)),
+        } => show_logs(root, follow, lines.unwrap_or(50)),
         // r[impl daemon.cli.status]
-        Some(Command::Status { root }) => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(show_status(root))
-        }
+        Command::Status { root, json } => show_status(root, json).await,
         // r[impl daemon.cli.kill]
-        Some(Command::Kill { root }) => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(kill_daemon(root))
-        }
-        // r[impl cli.no-args]
-        None => {
-            print_help();
+        Command::Kill { root } => kill_daemon(root).await,
+
+        // r[impl cli.skill.install]
+        Command::Skill { action } => match action {
+            SkillAction::Install { claude, codex } => install_skill(codex, claude),
+        },
+
+        // r[impl cli.mcp.register]
+        // r[impl cli.skill.install]
+        Command::Ai { claude, codex } => setup_ai_clients(codex, claude),
+
+        // r[impl cli.pre-commit]
+        Command::PreCommit { root, config } => {
+            let project_root = root.unwrap_or_else(|| find_project_root().unwrap_or_default());
+            let config_path = project_root.join(&config);
+            let cfg = load_bump_config(&config_path);
+            let passed = tracey::bump::pre_commit(&project_root, &cfg).await?;
+            if !passed {
+                std::process::exit(1);
+            }
             Ok(())
+        }
+
+        // r[impl cli.bump]
+        Command::Bump { root, config } => {
+            let project_root = root.unwrap_or_else(|| find_project_root().unwrap_or_default());
+            let config_path = project_root.join(&config);
+            let cfg = load_bump_config(&config_path);
+            let bumped = tracey::bump::bump(&project_root, &cfg).await?;
+            if bumped.is_empty() {
+                println!("No staged rule changes require a version bump.");
+            } else {
+                println!("Bumped {} rule(s):", bumped.len());
+                for id in &bumped {
+                    println!("  {id}");
+                }
+                println!();
+                println!("Affected spec files have been re-staged. Review and commit.");
+            }
+            Ok(())
+        }
+
+        // r[impl daemon.cli.query]
+        Command::Query { root, json, query } => {
+            let project_root = root.unwrap_or_else(|| find_project_root().unwrap_or_default());
+            let query_client =
+                bridge::query::QueryClient::new(project_root, bridge::query::Caller::Cli);
+            init_tracing(TracingConfig {
+                log_file: None,
+                enable_console: !json,
+                console_ansi: !json,
+                default_filter: "tracey=info",
+            })?;
+
+            if json {
+                let (output, has_errors) = query_json(&query_client, query).await;
+                println!("{}", output);
+                if has_errors {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+
+            let (output, has_errors) = match query {
+                QueryCommand::Status => (query_client.status().await, false),
+                QueryCommand::Uncovered { spec_impl, prefix } => (
+                    query_client
+                        .uncovered(spec_impl.as_deref(), prefix.as_deref())
+                        .await,
+                    false,
+                ),
+                QueryCommand::Untested { spec_impl, prefix } => (
+                    query_client
+                        .untested(spec_impl.as_deref(), prefix.as_deref())
+                        .await,
+                    false,
+                ),
+                QueryCommand::Unmapped { spec_impl, path } => (
+                    query_client
+                        .unmapped(spec_impl.as_deref(), path.as_deref())
+                        .await,
+                    false,
+                ),
+                QueryCommand::Stale { spec_impl, prefix } => (
+                    query_client
+                        .stale(spec_impl.as_deref(), prefix.as_deref())
+                        .await,
+                    false,
+                ),
+                QueryCommand::Rule { rule_ids } => (query_client.rules(&rule_ids).await, false),
+                QueryCommand::Config => (query_client.config().await, false),
+                QueryCommand::Validate { spec_impl, deny } => {
+                    let deny = ValidationDeny::parse(&deny)?;
+                    query_client
+                        .validate(spec_impl.as_deref(), deny.warnings)
+                        .await
+                }
+            };
+
+            println!("{}", output);
+            if has_errors {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+
+        Command::Gc { dry_run } => run_gc(dry_run),
+    }
+}
+
+/// Small helper type for JSON error output with proper escaping.
+#[derive(Debug, facet::Facet)]
+#[facet(rename_all = "camelCase")]
+struct JsonError {
+    error: String,
+}
+
+/// Serialize an error message as a JSON object: `{"error": "..."}`.
+fn json_error(message: &str) -> String {
+    facet_json::to_string_pretty(&JsonError {
+        error: message.to_string(),
+    })
+    .expect("JSON serialization failed")
+}
+
+/// Handle `tracey query --json <subcommand>` by calling the daemon client
+/// directly and serializing the typed response as JSON.
+async fn query_json(qc: &bridge::query::QueryClient, query: QueryCommand) -> (String, bool) {
+    use bridge::query::{parse_spec_impl, validate_spec_impl_selection};
+    use tracey_proto::*;
+
+    match query {
+        QueryCommand::Status => match qc.client.status().await {
+            Ok(resp) => (
+                facet_json::to_string_pretty(&resp).expect("JSON serialization failed"),
+                false,
+            ),
+            Err(e) => (json_error(&format!("{e:?}")), false),
+        },
+        QueryCommand::Uncovered { spec_impl, prefix } => {
+            let (spec, impl_name) = match spec_impl.as_deref() {
+                Some(raw) => {
+                    let config = match qc.client.config().await {
+                        Ok(config) => config,
+                        Err(e) => {
+                            return (json_error(&format!("failed to load config: {e:?}")), false);
+                        }
+                    };
+                    match validate_spec_impl_selection(Some(raw), &config) {
+                        Ok(values) => values,
+                        Err(error) => return (json_error(&error), false),
+                    }
+                }
+                None => parse_spec_impl(None),
+            };
+            let req = UncoveredRequest {
+                spec,
+                impl_name,
+                prefix,
+            };
+            match qc.client.uncovered(req).await {
+                Ok(resp) => (
+                    facet_json::to_string_pretty(&resp).expect("JSON serialization failed"),
+                    false,
+                ),
+                Err(e) => (json_error(&format!("{e:?}")), false),
+            }
+        }
+        QueryCommand::Untested { spec_impl, prefix } => {
+            let (spec, impl_name) = match spec_impl.as_deref() {
+                Some(raw) => {
+                    let config = match qc.client.config().await {
+                        Ok(config) => config,
+                        Err(e) => {
+                            return (json_error(&format!("failed to load config: {e:?}")), false);
+                        }
+                    };
+                    match validate_spec_impl_selection(Some(raw), &config) {
+                        Ok(values) => values,
+                        Err(error) => return (json_error(&error), false),
+                    }
+                }
+                None => parse_spec_impl(None),
+            };
+            let req = UntestedRequest {
+                spec,
+                impl_name,
+                prefix,
+            };
+            match qc.client.untested(req).await {
+                Ok(resp) => (
+                    facet_json::to_string_pretty(&resp).expect("JSON serialization failed"),
+                    false,
+                ),
+                Err(e) => (json_error(&format!("{e:?}")), false),
+            }
+        }
+        QueryCommand::Stale { spec_impl, prefix } => {
+            let (spec, impl_name) = match spec_impl.as_deref() {
+                Some(raw) => {
+                    let config = match qc.client.config().await {
+                        Ok(config) => config,
+                        Err(e) => {
+                            return (json_error(&format!("failed to load config: {e:?}")), false);
+                        }
+                    };
+                    match validate_spec_impl_selection(Some(raw), &config) {
+                        Ok(values) => values,
+                        Err(error) => return (json_error(&error), false),
+                    }
+                }
+                None => parse_spec_impl(None),
+            };
+            let req = StaleRequest {
+                spec,
+                impl_name,
+                prefix,
+            };
+            match qc.client.stale(req).await {
+                Ok(resp) => (
+                    facet_json::to_string_pretty(&resp).expect("JSON serialization failed"),
+                    false,
+                ),
+                Err(e) => (json_error(&format!("{e:?}")), false),
+            }
+        }
+        QueryCommand::Unmapped { spec_impl, path } => {
+            let (spec, impl_name) = match spec_impl.as_deref() {
+                Some(raw) => {
+                    let config = match qc.client.config().await {
+                        Ok(config) => config,
+                        Err(e) => {
+                            return (json_error(&format!("failed to load config: {e:?}")), false);
+                        }
+                    };
+                    match validate_spec_impl_selection(Some(raw), &config) {
+                        Ok(values) => values,
+                        Err(error) => return (json_error(&error), false),
+                    }
+                }
+                None => parse_spec_impl(None),
+            };
+            let req = UnmappedRequest {
+                spec,
+                impl_name,
+                path,
+            };
+            match qc.client.unmapped(req).await {
+                Ok(resp) => (
+                    facet_json::to_string_pretty(&resp).expect("JSON serialization failed"),
+                    false,
+                ),
+                Err(e) => (json_error(&format!("{e:?}")), false),
+            }
+        }
+        QueryCommand::Rule { rule_ids } => {
+            let mut infos = Vec::new();
+            for raw_id in &rule_ids {
+                let Some(parsed) = tracey_core::parse_rule_id(raw_id) else {
+                    return (json_error(&format!("invalid rule ID: {raw_id}")), false);
+                };
+                match qc.client.rule(parsed).await {
+                    Ok(Some(info)) => infos.push(info),
+                    Ok(None) => return (json_error(&format!("rule not found: {raw_id}")), false),
+                    Err(e) => return (json_error(&format!("{e:?}")), false),
+                }
+            }
+            if infos.len() == 1 {
+                (
+                    facet_json::to_string_pretty(&infos.into_iter().next().unwrap())
+                        .expect("JSON serialization failed"),
+                    false,
+                )
+            } else {
+                (
+                    facet_json::to_string_pretty(&infos).expect("JSON serialization failed"),
+                    false,
+                )
+            }
+        }
+        QueryCommand::Config => match qc.client.config().await {
+            Ok(resp) => (
+                facet_json::to_string_pretty(&resp).expect("JSON serialization failed"),
+                false,
+            ),
+            Err(e) => (json_error(&format!("{e:?}")), false),
+        },
+        QueryCommand::Validate { spec_impl, deny } => {
+            let deny = match ValidationDeny::parse(&deny) {
+                Ok(deny) => deny,
+                Err(e) => return (json_error(&e.to_string()), true),
+            };
+            if spec_impl.is_some() {
+                let config = match qc.client.config().await {
+                    Ok(config) => config,
+                    Err(e) => return (json_error(&format!("failed to load config: {e:?}")), true),
+                };
+                let (spec, impl_name) =
+                    match validate_spec_impl_selection(spec_impl.as_deref(), &config) {
+                        Ok(values) => values,
+                        Err(error) => return (json_error(&error), true),
+                    };
+                let req = ValidateRequest { spec, impl_name };
+                match qc.client.validate(req).await {
+                    Ok(resp) => {
+                        let has_errors = deny.should_fail(resp.error_count, resp.warning_count);
+                        (
+                            facet_json::to_string_pretty(&resp).expect("JSON serialization failed"),
+                            has_errors,
+                        )
+                    }
+                    Err(e) => (json_error(&format!("{e:?}")), true),
+                }
+            } else {
+                // Validate all spec/impl combinations
+                let status = match qc.client.status().await {
+                    Ok(s) => s,
+                    Err(e) => return (json_error(&format!("error getting status: {e:?}")), true),
+                };
+
+                let mut results = Vec::new();
+                let mut total_errors = 0usize;
+                let mut total_warnings = 0usize;
+                for impl_status in &status.impls {
+                    let req = ValidateRequest {
+                        spec: Some(impl_status.spec.clone()),
+                        impl_name: Some(impl_status.impl_name.clone()),
+                    };
+                    match qc.client.validate(req).await {
+                        Ok(result) => {
+                            total_errors += result.error_count;
+                            total_warnings += result.warning_count;
+                            results.push(result)
+                        }
+                        Err(e) => {
+                            return (
+                                json_error(&format!(
+                                    "error validating {}/{}: {e:?}",
+                                    impl_status.spec, impl_status.impl_name
+                                )),
+                                true,
+                            );
+                        }
+                    }
+                }
+
+                let json =
+                    facet_json::to_string_pretty(&results).expect("JSON serialization failed");
+                (json, deny.should_fail(total_errors, total_warnings))
+            }
         }
     }
 }
 
-fn print_help() {
-    println!(
-        r#"tracey - Measure spec coverage in Rust codebases
+#[cfg(test)]
+mod tests {
+    use super::ValidationDeny;
 
-{usage}:
-    tracey <COMMAND> [OPTIONS]
+    #[test]
+    fn parse_validation_deny_accepts_warnings_variants() {
+        let deny = ValidationDeny::parse(&["warnings".to_string()]).expect("parse warnings");
+        assert!(deny.warnings);
+        let deny = ValidationDeny::parse(&["warning".to_string()]).expect("parse warning");
+        assert!(deny.warnings);
+        let deny =
+            ValidationDeny::parse(&["warnings,warning".to_string()]).expect("parse comma list");
+        assert!(deny.warnings);
+    }
 
-{commands}:
-    {web}       Start the interactive web dashboard
-    {mcp}       Start the MCP server for AI assistants
-    {lsp}       Start the LSP server for editor integration
-    {daemon}    Start the tracey daemon (persistent server)
-    {logs}      Show daemon logs
-    {status}    Show daemon status
-    {kill}      Stop the running daemon
+    #[test]
+    fn parse_validation_deny_rejects_unknown_values() {
+        let err = ValidationDeny::parse(&["errors".to_string()]).expect_err("should fail");
+        assert!(err.to_string().contains("unknown value for --deny"));
+    }
 
-{options}:
-    -h, --help      Show this help message
+    #[test]
+    fn validation_deny_default_only_fails_on_errors() {
+        let deny = ValidationDeny::default();
+        assert!(!deny.should_fail(0, 1));
+        assert!(deny.should_fail(1, 0));
+    }
 
-Run 'tracey <COMMAND> --help' for more information on a command."#,
-        usage = "Usage".bold(),
-        commands = "Commands".bold(),
-        web = "web".cyan(),
-        mcp = "mcp".cyan(),
-        lsp = "lsp".cyan(),
-        daemon = "daemon".cyan(),
-        logs = "logs".cyan(),
-        status = "status".cyan(),
-        kill = "kill".cyan(),
-        options = "Options".bold(),
-    );
+    #[test]
+    fn validation_deny_warnings_fails_on_warnings() {
+        let deny = ValidationDeny::parse(&["warnings".to_string()]).expect("parse warnings");
+        assert!(deny.should_fail(0, 1));
+    }
+}
+
+fn cli_version_text() -> String {
+    let mut version = env!("CARGO_PKG_VERSION").to_string();
+
+    if let Some(git_commit) = option_env!("TRACEY_GIT_COMMIT") {
+        version.push_str(" (");
+        version.push_str(git_commit);
+
+        if let Some(build_date) = option_env!("TRACEY_BUILD_DATE") {
+            version.push(' ');
+            version.push_str(build_date);
+        }
+
+        version.push(')');
+    } else if let Some(build_date) = option_env!("TRACEY_BUILD_DATE") {
+        version.push_str(" (built ");
+        version.push_str(build_date);
+        version.push(')');
+    }
+
+    version
 }
 
 /// Configuration for tracing initialization.
 struct TracingConfig {
     /// If Some, also log to this file (creating parent dirs as needed).
     log_file: Option<PathBuf>,
+    /// If true, emit logs to console (stderr).
+    enable_console: bool,
+    /// If true, include ANSI color codes in console logs.
+    console_ansi: bool,
+    /// Default filter directive if RUST_LOG is not set.
+    default_filter: &'static str,
 }
 
 /// Initialize tracing with optional file logging.
@@ -250,12 +843,16 @@ fn init_tracing(config: TracingConfig) -> Result<()> {
     // Use RUST_LOG from environment, default to info if not set
     let filter = match std::env::var("RUST_LOG") {
         Ok(_) => tracing_subscriber::EnvFilter::from_default_env(),
-        Err(_) => tracing_subscriber::EnvFilter::new("tracey=info"),
+        Err(_) => tracing_subscriber::EnvFilter::new(config.default_filter),
     };
 
-    let console_layer = tracing_subscriber::fmt::layer().with_ansi(true);
+    let console_layer = config.enable_console.then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(config.console_ansi)
+            .with_writer(std::io::stderr)
+    });
 
-    if let Some(log_path) = config.log_file {
+    let file_layer = if let Some(log_path) = config.log_file {
         // Ensure parent directory exists
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -266,27 +863,67 @@ fn init_tracing(config: TracingConfig) -> Result<()> {
             .append(true)
             .open(&log_path)?;
 
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_writer(log_file);
-
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(console_layer)
-            .with(file_layer)
-            .init();
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(log_file),
+        )
     } else {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(console_layer)
-            .init();
+        None
+    };
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(console_layer)
+        .with(file_layer)
+        .init();
+
+    Ok(())
+}
+
+/// Build a bridge log path with process ID in the filename.
+fn bridge_log_path(project_root: &std::path::Path, bridge: &str) -> PathBuf {
+    daemon::state_dir(project_root).join(format!("{bridge}-{}.log", std::process::id()))
+}
+
+/// Write a startup marker so bridge launches are visible even before first tracing event.
+fn write_bridge_start_marker(
+    log_path: &std::path::Path,
+    command: &str,
+    project_root: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<()> {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    writeln!(
+        log_file,
+        "[ts={} pid={}] starting {} root={} config={} cwd={}",
+        now,
+        std::process::id(),
+        command,
+        project_root.display(),
+        config_path.display(),
+        std::env::current_dir()?.display()
+    )?;
 
     Ok(())
 }
 
 /// r[impl daemon.cli.logs]
-/// Show daemon logs from .tracey/daemon.log
+/// Show daemon logs from the state directory
 fn show_logs(root: Option<PathBuf>, follow: bool, lines: usize) -> Result<()> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
@@ -295,7 +932,7 @@ fn show_logs(root: Option<PathBuf>, follow: bool, lines: usize) -> Result<()> {
         None => find_project_root()?,
     };
 
-    let log_path = project_root.join(".tracey/daemon.log");
+    let log_path = daemon::state_dir(&project_root).join("daemon.log");
 
     if !log_path.exists() {
         eprintln!(
@@ -349,7 +986,9 @@ fn show_logs(root: Option<PathBuf>, follow: bool, lines: usize) -> Result<()> {
 
 /// r[impl daemon.cli.status]
 /// Show daemon status by connecting and calling health()
-async fn show_status(root: Option<PathBuf>) -> Result<()> {
+async fn show_status(root: Option<PathBuf>, json: bool) -> Result<()> {
+    use std::time::Duration;
+
     let project_root = match root {
         Some(r) => r,
         None => find_project_root()?,
@@ -357,85 +996,381 @@ async fn show_status(root: Option<PathBuf>) -> Result<()> {
 
     let endpoint = daemon::local_endpoint(&project_root);
 
-    // Check if endpoint exists
-    if !roam_local::endpoint_exists(&endpoint) {
-        println!("{}: No daemon running", "Status".yellow());
-        #[cfg(unix)]
-        println!("  Socket: {} (not found)", endpoint.display());
-        #[cfg(windows)]
-        println!("  Endpoint: {} (not found)", endpoint);
-        return Ok(());
-    }
-
     // Try to connect without auto-starting
-    match roam_local::connect(&endpoint).await {
-        Ok(stream) => {
-            // Create a minimal client to call health()
-            use roam_stream::{Connector, HandshakeConfig, NoDispatcher, connect};
-
-            struct DirectConnector {
-                stream: std::sync::Mutex<Option<roam_local::LocalStream>>,
+    let stream = match roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await {
+        Ok(s) => s,
+        Err(_) => {
+            if json {
+                println!("{}", json_error("no daemon running"));
+            } else {
+                println!("{}: No daemon running", "Status".yellow());
             }
+            return Ok(());
+        }
+    };
 
-            impl Connector for DirectConnector {
-                type Transport = roam_local::LocalStream;
-                async fn connect(&self) -> std::io::Result<Self::Transport> {
-                    self.stream
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .ok_or_else(|| std::io::Error::other("already connected"))
+    let (client, _session_handle) = roam::initiator(stream)
+        .establish::<tracey_proto::TraceyDaemonClient>(())
+        .await
+        .map_err(|e| eyre::eyre!("failed to connect to daemon: {e:?}"))?;
+
+    match tokio::time::timeout(Duration::from_secs(1), client.health()).await {
+        Ok(Ok(health)) => {
+            if json {
+                println!(
+                    "{}",
+                    facet_json::to_string_pretty(&health).expect("JSON serialization failed")
+                );
+            } else {
+                println!("{}: Daemon is running", "Status".green());
+                println!("  Uptime: {}s", health.uptime_secs);
+                println!("  Data version: {}", health.version);
+                println!(
+                    "  Watcher: {}",
+                    if health.watcher_active {
+                        "active".green().to_string()
+                    } else {
+                        "inactive".yellow().to_string()
+                    }
+                );
+                if let Some(err) = &health.watcher_error {
+                    println!("  Watcher error: {}", err.as_str().red());
                 }
+                if let Some(err) = &health.config_error {
+                    println!("  Config error: {}", err.as_str().red());
+                }
+                println!("  File events: {}", health.watcher_event_count);
+                println!("  Watched dirs: {}", health.watched_directories.len());
             }
-
-            let connector = DirectConnector {
-                stream: std::sync::Mutex::new(Some(stream)),
-            };
-            let client = connect(connector, HandshakeConfig::default(), NoDispatcher);
-            let client = tracey_proto::TraceyDaemonClient::new(client);
-
-            match client.health().await {
-                Ok(health) => {
-                    println!("{}: Daemon is running", "Status".green());
-                    println!("  Uptime: {}s", health.uptime_secs);
-                    println!("  Data version: {}", health.version);
-                    println!(
-                        "  Watcher: {}",
-                        if health.watcher_active {
-                            "active".green().to_string()
-                        } else {
-                            "inactive".yellow().to_string()
-                        }
-                    );
-                    if let Some(err) = &health.watcher_error {
-                        println!("  Watcher error: {}", err.as_str().red());
-                    }
-                    if let Some(err) = &health.config_error {
-                        println!("  Config error: {}", err.as_str().red());
-                    }
-                    println!("  File events: {}", health.watcher_event_count);
-                    println!("  Watched dirs: {}", health.watched_directories.len());
-                }
-                Err(e) => {
-                    println!("{}: Daemon connection failed", "Status".red());
-                    println!("  Error: {}", e);
-                }
+        }
+        Ok(Err(e)) => {
+            if json {
+                println!(
+                    "{}",
+                    json_error(&format!("daemon connection failed: {e:?}"))
+                );
+            } else {
+                println!("{}: Daemon connection failed", "Status".red());
+                println!("  Error: {e:?}");
             }
         }
         Err(_) => {
-            println!("{}: Daemon not responding", "Status".yellow());
-            #[cfg(unix)]
-            println!(
-                "  Socket exists at {} but cannot connect",
-                endpoint.display()
-            );
-            #[cfg(windows)]
-            println!("  Endpoint exists but cannot connect");
-            println!("  The daemon may have crashed. Run 'tracey kill' to clean up.");
+            if json {
+                println!(
+                    "{}",
+                    json_error("daemon not responding (health check timed out)")
+                );
+            } else {
+                println!(
+                    "{}: Daemon not responding (health check timed out)",
+                    "Status".yellow()
+                );
+                println!("  The daemon may be stuck. Run 'tracey kill' to restart it.");
+            }
         }
     }
 
     Ok(())
+}
+
+const SKILL_MD: &str = include_str!("../skill/SKILL.md");
+const SPEC_MD: &str = include_str!("../skill/references/tracey-spec.md");
+const CODEX_MCP_REGISTER_ARGS: &[&str] = &["mcp", "add", "tracey", "--", "tracey", "mcp"];
+const CLAUDE_MCP_REGISTER_ARGS: &[&str] = &[
+    "mcp",
+    "add",
+    "--transport",
+    "stdio",
+    "tracey",
+    "--",
+    "tracey",
+    "mcp",
+];
+
+#[derive(Clone, Copy, Debug)]
+enum AiClient {
+    Codex,
+    Claude,
+}
+
+impl AiClient {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn skill_dir(self, home: &Path) -> PathBuf {
+        match self {
+            Self::Codex => home.join(".codex/skills/tracey"),
+            Self::Claude => home.join(".claude/skills/tracey"),
+        }
+    }
+
+    fn register_command(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
+            Self::Codex => (
+                "codex",
+                "codex mcp add tracey -- tracey mcp",
+                CODEX_MCP_REGISTER_ARGS,
+            ),
+            Self::Claude => (
+                "claude",
+                "claude mcp add --transport stdio tracey -- tracey mcp",
+                CLAUDE_MCP_REGISTER_ARGS,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct McpRegistrationSummary {
+    attempted: usize,
+    succeeded: usize,
+}
+
+fn selected_ai_clients(codex: bool, claude: bool) -> Vec<AiClient> {
+    if codex || claude {
+        let mut clients = Vec::new();
+        if codex {
+            clients.push(AiClient::Codex);
+        }
+        if claude {
+            clients.push(AiClient::Claude);
+        }
+        clients
+    } else {
+        vec![AiClient::Codex, AiClient::Claude]
+    }
+}
+
+/// r[impl cli.skill.install]
+/// Install the bundled Tracey skill for Claude and/or Codex
+fn install_skill(codex: bool, claude: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| eyre!("could not determine home directory"))?;
+    let clients = selected_ai_clients(codex, claude);
+    let installed = install_skill_for_clients(&home, &clients)?;
+
+    println!("{}: Tracey skill installed", "Success".green());
+    for path in &installed {
+        println!("  {}", path.display());
+    }
+
+    Ok(())
+}
+
+/// r[impl cli.mcp.register]
+/// r[impl cli.skill.install]
+/// Configure AI assistants by registering MCP clients and installing bundled skills.
+fn setup_ai_clients(codex: bool, claude: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| eyre!("could not determine home directory"))?;
+    let clients = selected_ai_clients(codex, claude);
+
+    println!(
+        "{}: configuring tracey for AI assistants (MCP + skill)",
+        "Info".cyan()
+    );
+    let registration = register_mcp_for_clients(&clients)?;
+    let installed = install_skill_for_clients(&home, &clients)?;
+
+    println!("{}: Tracey skill installed", "Success".green());
+    for path in &installed {
+        println!("  {}", path.display());
+    }
+
+    if registration.succeeded > 0 {
+        println!(
+            "{}: registered tracey with {} MCP client(s)",
+            "Success".green(),
+            registration.succeeded
+        );
+    } else {
+        println!(
+            "{}: no MCP client registration succeeded (skill installation completed)",
+            "Warning".yellow()
+        );
+    }
+
+    Ok(())
+}
+
+/// Load config for pre-commit / bump: silently no-op if missing, warn if unparseable.
+fn load_bump_config(config_path: &std::path::Path) -> tracey::config::Config {
+    if !config_path.exists() {
+        return tracey::config::Config::default();
+    }
+    match tracey::load_config(&config_path.to_path_buf()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to parse tracey config at {}: {e:?}",
+                config_path.display()
+            );
+            tracey::config::Config::default()
+        }
+    }
+}
+
+fn install_skill_to(skill_dir: &Path) -> Result<()> {
+    let refs_dir = skill_dir.join("references");
+    std::fs::create_dir_all(&refs_dir)
+        .wrap_err_with(|| format!("failed to create {}", refs_dir.display()))?;
+
+    std::fs::write(skill_dir.join("SKILL.md"), SKILL_MD)
+        .wrap_err_with(|| format!("failed to write {}", skill_dir.join("SKILL.md").display()))?;
+
+    std::fs::write(refs_dir.join("tracey-spec.md"), SPEC_MD).wrap_err_with(|| {
+        format!(
+            "failed to write {}",
+            refs_dir.join("tracey-spec.md").display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn install_skill_for_clients(home: &Path, clients: &[AiClient]) -> Result<Vec<PathBuf>> {
+    let mut installed = Vec::new();
+    for client in clients {
+        let skill_dir = client.skill_dir(home);
+        install_skill_to(&skill_dir)?;
+        installed.push(skill_dir);
+    }
+    Ok(installed)
+}
+
+fn register_mcp_clients(args: &[String]) -> Result<()> {
+    let mut codex_requested = false;
+    let mut claude_requested = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--codex" => codex_requested = true,
+            "--claude" => claude_requested = true,
+            "-h" | "--help" => {
+                println!("Register tracey as an MCP server for Codex and/or Claude.");
+                println!();
+                println!("Usage:");
+                println!("  tracey mcp register [--codex] [--claude]");
+                println!();
+                println!("If no flags are provided, tracey tries both clients and skips any");
+                println!("client executable that's not found in PATH.");
+                println!();
+                println!("Tip: run 'tracey ai' to register MCP and install the Tracey skill.");
+                return Ok(());
+            }
+            unknown => {
+                return Err(eyre!(
+                    "unknown argument for 'tracey mcp register': {unknown}"
+                ));
+            }
+        }
+    }
+
+    let clients = selected_ai_clients(codex_requested, claude_requested);
+
+    println!("{}: registering tracey MCP server", "Info".cyan());
+    let summary = register_mcp_for_clients(&clients)?;
+
+    if summary.succeeded > 0 {
+        println!(
+            "{}: registered tracey with {} MCP client(s)",
+            "Success".green(),
+            summary.succeeded
+        );
+        return Ok(());
+    }
+
+    if summary.attempted == 0 {
+        return Err(eyre!("no MCP client selected"));
+    }
+
+    Err(eyre!(
+        "no MCP client registration succeeded (check command output above)"
+    ))
+}
+
+fn register_mcp_for_clients(clients: &[AiClient]) -> Result<McpRegistrationSummary> {
+    let mut summary = McpRegistrationSummary::default();
+
+    for client in clients {
+        summary.attempted += 1;
+        let (program, command_text, command_args) = client.register_command();
+
+        if !command_in_path(program) {
+            println!(
+                "  {} {}: not found in PATH, skipping",
+                "Skip".yellow(),
+                client.name()
+            );
+            continue;
+        }
+
+        if !confirm_command_consent(client.name(), command_text)? {
+            println!(
+                "  {} {}: consent not granted, skipping",
+                "Skip".yellow(),
+                client.name()
+            );
+            continue;
+        }
+
+        println!("  {} {}: {}", "Running".cyan(), client.name(), command_text);
+        if run_registration_command(program, command_args)? {
+            summary.succeeded += 1;
+        }
+    }
+
+    Ok(summary)
+}
+
+fn run_registration_command(program: &str, args: &[&str]) -> Result<bool> {
+    let output = ProcessCommand::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .wrap_err_with(|| format!("failed to run {}", program))?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !stdout.is_empty() {
+            println!("    {}", stdout);
+        }
+        println!("    {}", "ok".green());
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        eprintln!("    {}", stderr);
+    }
+    eprintln!("    {}", "failed".red());
+    Ok(false)
+}
+
+fn confirm_command_consent(client: &str, command: &str) -> Result<bool> {
+    print!("Detect {client} => run `{command}` [y/N] ? ");
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
+fn command_in_path(program: &str) -> bool {
+    match ProcessCommand::new(program)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 /// r[impl daemon.cli.kill]
@@ -455,30 +1390,12 @@ async fn kill_daemon(root: Option<PathBuf>) -> Result<()> {
     }
 
     // Try to connect and send shutdown
-    match roam_local::connect(&endpoint).await {
+    match roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await {
         Ok(stream) => {
-            use roam_stream::{Connector, HandshakeConfig, NoDispatcher, connect};
-
-            struct DirectConnector {
-                stream: std::sync::Mutex<Option<roam_local::LocalStream>>,
-            }
-
-            impl Connector for DirectConnector {
-                type Transport = roam_local::LocalStream;
-                async fn connect(&self) -> std::io::Result<Self::Transport> {
-                    self.stream
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .ok_or_else(|| std::io::Error::other("already connected"))
-                }
-            }
-
-            let connector = DirectConnector {
-                stream: std::sync::Mutex::new(Some(stream)),
-            };
-            let client = connect(connector, HandshakeConfig::default(), NoDispatcher);
-            let client = tracey_proto::TraceyDaemonClient::new(client);
+            let (client, _session_handle) = roam::initiator(stream)
+                .establish::<tracey_proto::TraceyDaemonClient>(())
+                .await
+                .map_err(|e| eyre::eyre!("failed to connect to daemon: {e:?}"))?;
 
             match client.shutdown().await {
                 Ok(()) => {
@@ -486,7 +1403,7 @@ async fn kill_daemon(root: Option<PathBuf>) -> Result<()> {
                 }
                 Err(e) => {
                     // Connection may close before we get a response, that's OK
-                    let err_str = e.to_string();
+                    let err_str = format!("{e:?}");
                     if err_str.contains("closed") {
                         println!("{}: Daemon stopped", "Success".green());
                     } else {
@@ -508,6 +1425,110 @@ async fn kill_daemon(root: Option<PathBuf>) -> Result<()> {
             let _ = roam_local::remove_endpoint(&endpoint);
             println!("{}: Cleaned up", "Success".green());
         }
+    }
+
+    Ok(())
+}
+
+/// Remove orphaned state directories whose projects no longer exist on disk.
+fn run_gc(dry_run: bool) -> Result<()> {
+    let base = daemon::state_base_dir();
+
+    if !base.exists() {
+        println!("No state directory found at {}", base.display());
+        return Ok(());
+    }
+
+    let entries: Vec<_> = std::fs::read_dir(&base)
+        .wrap_err_with(|| format!("Failed to read state directory: {}", base.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+
+    if entries.is_empty() {
+        println!("No state directories found.");
+        return Ok(());
+    }
+
+    let mut removed = 0usize;
+    for entry in &entries {
+        let dir = entry.path();
+        let meta_path = dir.join("project-root");
+
+        let orphaned = match std::fs::read(&meta_path) {
+            Ok(bytes) => {
+                #[cfg(unix)]
+                let project_root = {
+                    use std::os::unix::ffi::OsStrExt;
+                    PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))
+                };
+                #[cfg(not(unix))]
+                let project_root = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
+
+                !project_root.exists()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Directory exists but has no project-root file. This can
+                // happen during a race with a daemon that just called
+                // create_dir_all but hasn't written the metadata yet, so
+                // only treat it as orphaned if the directory is old enough
+                // to rule out a concurrent startup.
+                let dominated_by_race = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age < std::time::Duration::from_secs(60));
+                !dominated_by_race
+            }
+            Err(e) => {
+                eprintln!(
+                    "{}: Failed to read {}: {}",
+                    "Warning".yellow(),
+                    meta_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        if !orphaned {
+            continue;
+        }
+
+        // Don't remove state dirs with a live daemon, even if the project root is gone.
+        let pid_path = dir.join("daemon.pid");
+        if let Some((pid, _)) = daemon::read_pid_file_at(&pid_path)
+            && daemon::is_pid_alive(pid)
+        {
+            continue;
+        }
+
+        if dry_run {
+            println!("Would remove: {}", dir.display());
+        } else {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => println!("{}: Removed {}", "Removed".red(), dir.display()),
+                Err(e) => eprintln!(
+                    "{}: Failed to remove {}: {}",
+                    "Error".red(),
+                    dir.display(),
+                    e
+                ),
+            }
+        }
+        removed += 1;
+    }
+
+    if removed == 0 {
+        println!("Nothing to clean up.");
+    } else if dry_run {
+        println!(
+            "\n{} orphaned state dir(s) found. Run without --dry-run to remove.",
+            removed
+        );
+    } else {
+        println!("\nRemoved {} orphaned state dir(s).", removed);
     }
 
     Ok(())

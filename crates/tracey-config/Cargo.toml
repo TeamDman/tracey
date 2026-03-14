@@ -1,7 +1,10 @@
 [package]
 name = "tracey-config"
-version = "1.0.0"
-description = "Configuration types for tracey"
+version.workspace = true
+description = "Configuration types for tracey spec coverage tool"
+keywords = ["specification", "coverage", "traceability", "configuration", "tracey"]
+categories = ["development-tools"]
+readme = "../../README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

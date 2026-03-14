@@ -9,8 +9,9 @@
 //! data and provides query methods + formatting.
 
 use std::collections::BTreeMap;
+use tracey_core::RuleId;
 
-use crate::data::{ApiCodeRef, ApiFileEntry, ApiRule, DashboardData, ImplKey, OutlineEntry};
+use crate::data::{ApiCodeRef, ApiFileEntry, ApiRule, DashboardData, ImplKey};
 
 // ============================================================================
 // Delta Tracking
@@ -20,7 +21,7 @@ use crate::data::{ApiCodeRef, ApiFileEntry, ApiRule, DashboardData, ImplKey, Out
 #[derive(Debug, Clone)]
 pub struct CoverageChange {
     /// The rule ID
-    pub rule_id: String,
+    pub rule_id: RuleId,
     /// Where the reference was added (if newly covered)
     pub file: String,
     /// Line number
@@ -33,7 +34,10 @@ pub struct CoverageChange {
 #[derive(Debug, Clone, Default)]
 pub struct CoverageStats {
     pub total_rules: usize,
+    /// Rules with at least one exact implementation reference (not stale).
     pub impl_covered: usize,
+    /// Rules where any reference is stale. Mutually exclusive with impl_covered.
+    pub stale_covered: usize,
     pub verify_covered: usize,
     pub fully_covered: usize, // both impl and verify
     pub impl_percent: f64,
@@ -43,16 +47,22 @@ pub struct CoverageStats {
 impl CoverageStats {
     pub fn from_rules(rules: &[ApiRule]) -> Self {
         let total = rules.len();
-        let impl_covered = rules.iter().filter(|r| !r.impl_refs.is_empty()).count();
+        // A rule is stale if is_stale is set; stale rules are NOT counted as impl_covered.
+        let stale_covered = rules.iter().filter(|r| r.is_stale).count();
+        let impl_covered = rules
+            .iter()
+            .filter(|r| !r.is_stale && !r.impl_refs.is_empty())
+            .count();
         let verify_covered = rules.iter().filter(|r| !r.verify_refs.is_empty()).count();
         let fully_covered = rules
             .iter()
-            .filter(|r| !r.impl_refs.is_empty() && !r.verify_refs.is_empty())
+            .filter(|r| !r.is_stale && !r.impl_refs.is_empty() && !r.verify_refs.is_empty())
             .count();
 
         Self {
             total_rules: total,
             impl_covered,
+            stale_covered,
             verify_covered,
             fully_covered,
             impl_percent: if total > 0 {
@@ -75,7 +85,7 @@ pub struct ImplDelta {
     /// Rules that became covered (had no refs, now have refs)
     pub newly_covered: Vec<CoverageChange>,
     /// Rules that lost coverage (had refs, now have none)
-    pub newly_uncovered: Vec<String>,
+    pub newly_uncovered: Vec<RuleId>,
     /// Previous stats
     pub prev_stats: CoverageStats,
     /// Current stats
@@ -112,15 +122,15 @@ impl Delta {
             let impl_key = format!("{}/{}", key.0, key.1);
 
             let old_forward = old.forward_by_impl.get(key);
-            let old_rules: BTreeMap<&str, &ApiRule> = old_forward
-                .map(|f| f.rules.iter().map(|r| (r.id.as_str(), r)).collect())
+            let old_rules: BTreeMap<&RuleId, &ApiRule> = old_forward
+                .map(|f| f.rules.iter().map(|r| (&r.id, r)).collect())
                 .unwrap_or_default();
 
             let mut newly_covered = Vec::new();
             let mut newly_uncovered = Vec::new();
 
             for new_rule in &new_forward.rules {
-                let old_rule = old_rules.get(new_rule.id.as_str());
+                let old_rule = old_rules.get(&new_rule.id);
 
                 let was_impl_covered = old_rule.is_some_and(|r| !r.impl_refs.is_empty());
                 let is_impl_covered = !new_rule.impl_refs.is_empty();
@@ -239,7 +249,6 @@ impl<'a> QueryEngine<'a> {
     ) -> Option<UncoveredResult> {
         let key: ImplKey = (spec.to_string(), impl_name.to_string());
         let forward = self.data.forward_by_impl.get(&key)?;
-        let spec_data = self.data.specs_content_by_impl.get(&key)?;
 
         let stats = CoverageStats::from_rules(&forward.rules);
 
@@ -250,13 +259,13 @@ impl<'a> QueryEngine<'a> {
             .filter(|r| r.impl_refs.is_empty())
             .filter(|r| {
                 prefix_filter
-                    .map(|p| r.id.to_lowercase().starts_with(&p.to_lowercase()))
+                    .map(|p| r.id.base.to_lowercase().starts_with(&p.to_lowercase()))
                     .unwrap_or(true)
             })
             .collect();
 
         // Build section mapping from outline
-        let by_section = group_rules_by_section(&uncovered_rules, &spec_data.outline);
+        let by_section = group_rules_by_section(&uncovered_rules);
 
         Some(UncoveredResult {
             spec: spec.to_string(),
@@ -278,7 +287,6 @@ impl<'a> QueryEngine<'a> {
     ) -> Option<UntestedResult> {
         let key: ImplKey = (spec.to_string(), impl_name.to_string());
         let forward = self.data.forward_by_impl.get(&key)?;
-        let spec_data = self.data.specs_content_by_impl.get(&key)?;
 
         let stats = CoverageStats::from_rules(&forward.rules);
 
@@ -289,12 +297,12 @@ impl<'a> QueryEngine<'a> {
             .filter(|r| !r.impl_refs.is_empty() && r.verify_refs.is_empty())
             .filter(|r| {
                 prefix_filter
-                    .map(|p| r.id.to_lowercase().starts_with(&p.to_lowercase()))
+                    .map(|p| r.id.base.to_lowercase().starts_with(&p.to_lowercase()))
                     .unwrap_or(true)
             })
             .collect();
 
-        let by_section = group_rules_by_section(&untested_rules, &spec_data.outline);
+        let by_section = group_rules_by_section(&untested_rules);
 
         Some(UntestedResult {
             spec: spec.to_string(),
@@ -303,6 +311,50 @@ impl<'a> QueryEngine<'a> {
             by_section,
             total_untested: untested_rules.len(),
             prefix_filter: prefix_filter.map(|s| s.to_string()),
+        })
+    }
+
+    /// Get stale references for a spec/impl, optionally filtered by rule ID prefix
+    pub fn stale(
+        &self,
+        spec: &str,
+        impl_name: &str,
+        prefix_filter: Option<&str>,
+    ) -> Option<StaleResult> {
+        let key: ImplKey = (spec.to_string(), impl_name.to_string());
+        let forward = self.data.forward_by_impl.get(&key)?;
+
+        let stats = CoverageStats::from_rules(&forward.rules);
+
+        let mut entries: Vec<StaleEntryResult> = Vec::new();
+
+        for rule in &forward.rules {
+            if rule.stale_refs.is_empty() {
+                continue;
+            }
+            if let Some(p) = prefix_filter
+                && !rule.id.base.to_lowercase().starts_with(&p.to_lowercase())
+            {
+                continue;
+            }
+            for sr in &rule.stale_refs {
+                entries.push(StaleEntryResult {
+                    current_id: rule.id.clone(),
+                    file: sr.file.clone(),
+                    line: sr.line,
+                    reference_id: sr.reference_id.clone(),
+                });
+            }
+        }
+
+        // Sort by file, then line
+        entries.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+
+        Some(StaleResult {
+            spec: spec.to_string(),
+            impl_name: impl_name.to_string(),
+            stats,
+            entries,
         })
     }
 
@@ -402,23 +454,36 @@ impl<'a> QueryEngine<'a> {
     /// Get a specific rule by ID
     // r[impl mcp.tool.req]
     // r[impl mcp.tool.req.all-impls]
-    pub fn rule(&self, rule_id: &str) -> Option<RuleInfo> {
+    pub fn rule(&self, rule_id: &RuleId) -> Option<RuleInfo> {
         // Collect coverage from all impls for this rule
         let mut coverage = Vec::new();
         let mut result: Option<RuleInfo> = None;
 
         for (key, forward) in &self.data.forward_by_impl {
-            if let Some(rule) = forward.rules.iter().find(|r| r.id == rule_id) {
+            // Try exact match first, then fall back to latest version with matching base
+            let rule = forward
+                .rules
+                .iter()
+                .find(|r| r.id.base == rule_id.base && r.id.version == rule_id.version)
+                .or_else(|| {
+                    forward
+                        .rules
+                        .iter()
+                        .filter(|r| r.id.base == rule_id.base)
+                        .max_by_key(|r| r.id.version)
+                });
+            if let Some(rule) = rule {
                 // Capture rule metadata from first match
                 if result.is_none() {
                     result = Some(RuleInfo {
-                        id: rule_id.to_string(),
+                        id: rule.id.clone(),
                         raw: rule.raw.clone(),
                         html: rule.html.clone(),
                         source_file: rule.source_file.clone(),
                         source_line: rule.source_line,
                         status: rule.status.clone(),
                         level: rule.level.clone(),
+                        is_stale: rule.is_stale,
                         coverage: Vec::new(), // Will be set at the end
                     });
                 }
@@ -468,8 +533,24 @@ pub struct UntestedResult {
 
 #[derive(Debug, Clone)]
 pub struct RuleRef {
-    pub id: String,
+    pub id: RuleId,
     pub impl_refs: Vec<ApiCodeRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaleResult {
+    pub spec: String,
+    pub impl_name: String,
+    pub stats: CoverageStats,
+    pub entries: Vec<StaleEntryResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaleEntryResult {
+    pub current_id: RuleId,
+    pub file: String,
+    pub line: usize,
+    pub reference_id: RuleId,
 }
 
 #[derive(Debug, Clone)]
@@ -528,7 +609,7 @@ pub struct ImplCoverage {
 
 #[derive(Debug, Clone)]
 pub struct RuleInfo {
-    pub id: String,
+    pub id: RuleId,
     /// Raw markdown source (without r[...] marker)
     pub raw: String,
     pub html: String,
@@ -536,6 +617,8 @@ pub struct RuleInfo {
     pub source_line: Option<usize>,
     pub status: Option<String>,
     pub level: Option<String>,
+    /// True if any reference to this rule is stale
+    pub is_stale: bool,
     /// Coverage across all implementations
     pub coverage: Vec<ImplCoverage>,
 }
@@ -561,10 +644,7 @@ impl RuleInfo {
 // Helpers
 // ============================================================================
 
-fn group_rules_by_section(
-    rules: &[&ApiRule],
-    _outline: &[OutlineEntry],
-) -> BTreeMap<String, Vec<RuleRef>> {
+fn group_rules_by_section(rules: &[&ApiRule]) -> BTreeMap<String, Vec<RuleRef>> {
     let mut result: BTreeMap<String, Vec<RuleRef>> = BTreeMap::new();
 
     for rule in rules {
@@ -1018,6 +1098,11 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+    use tracey_core::parse_rule_id;
+
+    fn rid(id: &str) -> RuleId {
+        parse_rule_id(id).expect("valid rule id")
+    }
 
     /// Create a test fixture with spec, impl files, and config
     async fn create_test_fixture() -> (TempDir, PathBuf) {
@@ -1056,7 +1141,6 @@ fn do_foo_baz() {}
         let config_content = r#"specs (
   {
     name test-spec
-    prefix r
     include (docs/spec/**/*.md)
     impls (
       {
@@ -1096,14 +1180,14 @@ fn do_foo_baz() {}
         assert_eq!(stats.impl_covered, 2, "Should have 2 covered rules");
 
         // Now look up each covered rule and verify impl_refs are populated
-        let foo_bar = engine.rule("foo.bar").expect("foo.bar should exist");
+        let foo_bar = engine.rule(&rid("foo.bar")).expect("foo.bar should exist");
         assert!(
             foo_bar.has_any_impl(),
             "foo.bar should have impl_refs, got: {:?}",
             foo_bar.coverage
         );
 
-        let foo_baz = engine.rule("foo.baz").expect("foo.baz should exist");
+        let foo_baz = engine.rule(&rid("foo.baz")).expect("foo.baz should exist");
         assert!(
             foo_baz.has_any_impl(),
             "foo.baz should have impl_refs, got: {:?}",
@@ -1112,7 +1196,7 @@ fn do_foo_baz() {}
 
         // Uncovered rule should exist but have no impl_refs
         let uncovered = engine
-            .rule("uncovered.rule")
+            .rule(&rid("uncovered.rule"))
             .expect("uncovered.rule should exist");
         assert!(
             !uncovered.has_any_impl(),
@@ -1143,7 +1227,7 @@ fn do_foo_baz() {}
         // Count covered rules via individual lookups
         let mut lookup_covered = 0;
         for rule_id in ["foo.bar", "foo.baz", "uncovered.rule"] {
-            if let Some(rule) = engine.rule(rule_id)
+            if let Some(rule) = engine.rule(&rid(rule_id))
                 && rule.has_any_impl()
             {
                 lookup_covered += 1;
@@ -1205,7 +1289,6 @@ fn only_b() {}
         let config_content = r#"specs (
   {
     name test-spec
-    prefix r
     include (docs/spec/**/*.md)
     impls (
       {
@@ -1252,7 +1335,7 @@ fn only_b() {}
         // Now check individual rule lookups
         // rule() now returns coverage for ALL impls, so we can see where it's implemented
         let shared = engine
-            .rule("shared.rule")
+            .rule(&rid("shared.rule"))
             .expect("shared.rule should exist");
         // shared.rule is implemented in both impls
         assert!(shared.has_any_impl(), "shared.rule should have impl_refs");
@@ -1262,7 +1345,9 @@ fn only_b() {}
             "shared.rule should have coverage for 2 impls"
         );
 
-        let only_a = engine.rule("only.in.a").expect("only.in.a should exist");
+        let only_a = engine
+            .rule(&rid("only.in.a"))
+            .expect("only.in.a should exist");
         // This rule is only in impl-a, but coverage shows both impls
         assert!(only_a.has_any_impl(), "only.in.a should have impl_refs");
         // Verify it's covered in impl-a
@@ -1286,7 +1371,9 @@ fn only_b() {}
             "only.in.a should not be covered in impl-b"
         );
 
-        let only_b = engine.rule("only.in.b").expect("only.in.b should exist");
+        let only_b = engine
+            .rule(&rid("only.in.b"))
+            .expect("only.in.b should exist");
         // This rule is only in impl-b - with the fix, has_any_impl() should be true
         assert!(
             only_b.has_any_impl(),
@@ -1312,5 +1399,40 @@ fn only_b() {}
             !impl_b_cov.impl_refs.is_empty(),
             "only.in.b should be covered in impl-b"
         );
+    }
+
+    #[tokio::test]
+    async fn test_batch_rule_lookup() {
+        let (_tmp, root) = create_test_fixture().await;
+        let config_path = root.join(".config/tracey/config.styx");
+        let config = crate::load_config(&config_path).unwrap();
+
+        let data = crate::data::build_dashboard_data(&root, &config, 1, true)
+            .await
+            .unwrap();
+
+        let engine = QueryEngine::new(&data);
+
+        // Batch lookup of multiple rules — simulates what `tracey query rule id1 id2 id3` does
+        let ids = ["foo.bar", "foo.baz", "uncovered.rule", "nonexistent.rule"];
+        let results: Vec<Option<RuleInfo>> = ids.iter().map(|id| engine.rule(&rid(id))).collect();
+
+        // foo.bar: exists, covered
+        let foo_bar = results[0].as_ref().expect("foo.bar should exist");
+        assert!(foo_bar.has_any_impl(), "foo.bar should be covered");
+
+        // foo.baz: exists, covered
+        let foo_baz = results[1].as_ref().expect("foo.baz should exist");
+        assert!(foo_baz.has_any_impl(), "foo.baz should be covered");
+
+        // uncovered.rule: exists, not covered
+        let uncovered = results[2].as_ref().expect("uncovered.rule should exist");
+        assert!(
+            !uncovered.has_any_impl(),
+            "uncovered.rule should not be covered"
+        );
+
+        // nonexistent.rule: does not exist
+        assert!(results[3].is_none(), "nonexistent.rule should not exist");
     }
 }

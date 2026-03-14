@@ -6,7 +6,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tracey_core::parse_rule_id;
 use tracey_proto::*;
+
+mod common;
+
+fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam::RoamError<E>>) -> T {
+    res.expect("RPC call failed")
+}
 
 /// Get the path to the test fixtures directory.
 fn fixtures_dir() -> PathBuf {
@@ -28,9 +35,14 @@ async fn create_test_engine() -> Arc<tracey::daemon::Engine> {
 }
 
 /// Helper to create a service for testing.
-async fn create_test_service() -> tracey::daemon::TraceyService {
+async fn create_test_service() -> common::RpcTestService {
     let engine = create_test_engine().await;
-    tracey::daemon::TraceyService::new(engine)
+    let service = tracey::daemon::TraceyService::new(engine);
+    common::create_test_rpc_service(service).await
+}
+
+fn rid(id: &str) -> tracey_core::RuleId {
+    parse_rule_id(id).expect("valid rule id")
 }
 
 // ============================================================================
@@ -39,10 +51,8 @@ async fn create_test_service() -> tracey::daemon::TraceyService {
 
 #[tokio::test]
 async fn test_mcp_status_tool() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let status = service.status().await;
+    let status = rpc(service.client.status().await);
 
     // Verify we get coverage information
     assert!(!status.impls.is_empty(), "Expected at least one impl");
@@ -66,8 +76,6 @@ async fn test_mcp_status_tool() {
 
 #[tokio::test]
 async fn test_mcp_uncovered_tool_no_filter() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = UncoveredRequest {
         spec: Some("test".to_string()),
@@ -75,7 +83,7 @@ async fn test_mcp_uncovered_tool_no_filter() {
         prefix: None,
     };
 
-    let response = service.uncovered(req).await;
+    let response = rpc(service.client.uncovered(req).await);
 
     // Should return list of uncovered rules
     assert_eq!(response.spec, "test");
@@ -86,8 +94,6 @@ async fn test_mcp_uncovered_tool_no_filter() {
 
 #[tokio::test]
 async fn test_mcp_uncovered_tool_with_prefix() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = UncoveredRequest {
         spec: Some("test".to_string()),
@@ -95,13 +101,13 @@ async fn test_mcp_uncovered_tool_with_prefix() {
         prefix: Some("data".to_string()),
     };
 
-    let response = service.uncovered(req).await;
+    let response = rpc(service.client.uncovered(req).await);
 
     // Filtered by prefix - all rules should start with "data."
     for section in &response.by_section {
         for rule in &section.rules {
             assert!(
-                rule.id.starts_with("data."),
+                rule.id.base.starts_with("data."),
                 "Rule {} doesn't match prefix 'data.'",
                 rule.id
             );
@@ -111,8 +117,6 @@ async fn test_mcp_uncovered_tool_with_prefix() {
 
 #[tokio::test]
 async fn test_mcp_uncovered_tool_auto_select() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
     // When only one spec/impl exists, it should be auto-selected
@@ -122,7 +126,7 @@ async fn test_mcp_uncovered_tool_auto_select() {
         prefix: None,
     };
 
-    let response = service.uncovered(req).await;
+    let response = rpc(service.client.uncovered(req).await);
 
     // Should auto-select the only available spec/impl
     assert_eq!(response.spec, "test");
@@ -135,8 +139,6 @@ async fn test_mcp_uncovered_tool_auto_select() {
 
 #[tokio::test]
 async fn test_mcp_untested_tool() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = UntestedRequest {
         spec: Some("test".to_string()),
@@ -144,7 +146,7 @@ async fn test_mcp_untested_tool() {
         prefix: None,
     };
 
-    let response = service.untested(req).await;
+    let response = rpc(service.client.untested(req).await);
 
     // Should return rules that have impl but no verify
     assert_eq!(response.spec, "test");
@@ -159,8 +161,6 @@ async fn test_mcp_untested_tool() {
 
 #[tokio::test]
 async fn test_mcp_unmapped_tool() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = UnmappedRequest {
         spec: Some("test".to_string()),
@@ -168,7 +168,7 @@ async fn test_mcp_unmapped_tool() {
         path: None,
     };
 
-    let response = service.unmapped(req).await;
+    let response = rpc(service.client.unmapped(req).await);
 
     // Should return file tree with coverage info
     assert_eq!(response.spec, "test");
@@ -178,8 +178,6 @@ async fn test_mcp_unmapped_tool() {
 
 #[tokio::test]
 async fn test_mcp_unmapped_tool_with_path_filter() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = UnmappedRequest {
         spec: Some("test".to_string()),
@@ -187,7 +185,7 @@ async fn test_mcp_unmapped_tool_with_path_filter() {
         path: Some("src".to_string()),
     };
 
-    let response = service.unmapped(req).await;
+    let response = rpc(service.client.unmapped(req).await);
 
     // Should filter to only show src/ files
     for entry in &response.entries {
@@ -205,15 +203,13 @@ async fn test_mcp_unmapped_tool_with_path_filter() {
 
 #[tokio::test]
 async fn test_mcp_rule_tool_found() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let rule = service.rule("auth.login".to_string()).await;
+    let rule = rpc(service.client.rule(rid("auth.login")).await);
 
     assert!(rule.is_some(), "Expected auth.login rule to exist");
 
     let info = rule.unwrap();
-    assert_eq!(info.id, "auth.login");
+    assert_eq!(info.id, rid("auth.login"));
     assert!(!info.raw.is_empty(), "Expected rule raw markdown");
     assert!(
         info.source_file.is_some(),
@@ -223,20 +219,16 @@ async fn test_mcp_rule_tool_found() {
 
 #[tokio::test]
 async fn test_mcp_rule_tool_not_found() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let rule = service.rule("nonexistent.rule.id".to_string()).await;
+    let rule = rpc(service.client.rule(rid("nonexistent.rule.id")).await);
 
     assert!(rule.is_none(), "Expected nonexistent rule to return None");
 }
 
 #[tokio::test]
 async fn test_mcp_rule_tool_coverage_info() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let rule = service.rule("auth.login".to_string()).await;
+    let rule = rpc(service.client.rule(rid("auth.login")).await);
 
     let info = rule.expect("Expected rule to exist");
 
@@ -261,10 +253,8 @@ async fn test_mcp_rule_tool_coverage_info() {
 
 #[tokio::test]
 async fn test_mcp_config_tool() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let config = service.config().await;
+    let config = rpc(service.client.config().await);
 
     // Should return project configuration
     assert!(!config.specs.is_empty(), "Expected at least one spec");
@@ -283,10 +273,8 @@ async fn test_mcp_config_tool() {
 
 #[tokio::test]
 async fn test_mcp_reload_tool() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let response = service.reload().await;
+    let response = rpc(service.client.reload().await);
 
     // Should return rebuild info
     assert!(response.version > 0, "Expected version > 0");
@@ -304,15 +292,13 @@ async fn test_mcp_reload_tool() {
 
 #[tokio::test]
 async fn test_mcp_validate_tool() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = ValidateRequest {
         spec: Some("test".to_string()),
         impl_name: Some("rust".to_string()),
     };
 
-    let result = service.validate(req).await;
+    let result = rpc(service.client.validate(req).await);
 
     // Should return validation results
     assert_eq!(result.spec, "test");
@@ -323,8 +309,6 @@ async fn test_mcp_validate_tool() {
 
 #[tokio::test]
 async fn test_mcp_validate_tool_auto_select() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
     // When only one spec/impl exists, it should be auto-selected
@@ -333,7 +317,7 @@ async fn test_mcp_validate_tool_auto_select() {
         impl_name: None,
     };
 
-    let result = service.validate(req).await;
+    let result = rpc(service.client.validate(req).await);
 
     // Should auto-select the only available spec/impl
     assert_eq!(result.spec, "test");
@@ -346,12 +330,10 @@ async fn test_mcp_validate_tool_auto_select() {
 
 #[tokio::test]
 async fn test_mcp_search() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
     // Search for "auth"
-    let results = service.search("auth".to_string(), 10).await;
+    let results = rpc(service.client.search("auth".to_string(), 10).await);
 
     // Should find rules starting with "auth."
     assert!(!results.is_empty(), "Expected search results for 'auth'");
@@ -373,12 +355,10 @@ async fn test_mcp_search() {
 
 #[tokio::test]
 async fn test_mcp_search_limit() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
     // Search with limit of 2
-    let results = service.search("".to_string(), 2).await;
+    let results = rpc(service.client.search("".to_string(), 2).await);
 
     // Should respect the limit
     assert!(results.len() <= 2, "Expected at most 2 results");
@@ -390,12 +370,11 @@ async fn test_mcp_search_limit() {
 
 #[tokio::test]
 async fn test_mcp_forward_data() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let forward = service
+    let forward = rpc(service
+        .client
         .forward("test".to_string(), "rust".to_string())
-        .await;
+        .await);
 
     assert!(forward.is_some(), "Expected forward data for test/rust");
 
@@ -404,18 +383,17 @@ async fn test_mcp_forward_data() {
 
     // Check that rules have IDs
     for rule in &data.rules {
-        assert!(!rule.id.is_empty(), "Rule ID should not be empty");
+        assert!(!rule.id.base.is_empty(), "Rule ID should not be empty");
     }
 }
 
 #[tokio::test]
 async fn test_mcp_reverse_data() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let reverse = service
+    let reverse = rpc(service
+        .client
         .reverse("test".to_string(), "rust".to_string())
-        .await;
+        .await);
 
     assert!(reverse.is_some(), "Expected reverse data for test/rust");
 

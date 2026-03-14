@@ -6,16 +6,28 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tracey_core::parse_rule_id;
 use tracey_proto::*;
 
 // Re-export test modules
 mod common;
+
+fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam::RoamError<E>>) -> T {
+    res.expect("RPC call failed")
+}
 
 /// Get the path to the test fixtures directory.
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
+}
+
+/// Get the path to a named fixture set directory.
+fn fixtures_named(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(format!("fixtures-{name}"))
 }
 
 /// Helper to create an engine for testing.
@@ -30,10 +42,50 @@ async fn create_test_engine() -> Arc<tracey::daemon::Engine> {
     )
 }
 
+/// Helper to create an engine from a named fixture set.
+async fn create_test_engine_named(name: &str) -> Arc<tracey::daemon::Engine> {
+    let project_root = fixtures_named(name);
+    let config_path = project_root.join("config.styx");
+
+    Arc::new(
+        tracey::daemon::Engine::new(project_root, config_path)
+            .await
+            .expect("Failed to create engine"),
+    )
+}
+
 /// Helper to create a service for testing.
-async fn create_test_service() -> tracey::daemon::TraceyService {
+async fn create_test_service() -> common::RpcTestService {
     let engine = create_test_engine().await;
-    tracey::daemon::TraceyService::new(engine)
+    let service = tracey::daemon::TraceyService::new(engine);
+    common::create_test_rpc_service(service).await
+}
+
+/// Helper to create a service from a named fixture set.
+async fn create_test_service_named(name: &str) -> common::RpcTestService {
+    let engine = create_test_engine_named(name).await;
+    let service = tracey::daemon::TraceyService::new(engine);
+    common::create_test_rpc_service(service).await
+}
+
+/// Helper to create an isolated test project with its own engine.
+async fn create_isolated_test_service() -> (tempfile::TempDir, common::RpcTestService) {
+    let temp = common::create_temp_project();
+    let project_root = temp.path().to_path_buf();
+    let config_path = project_root.join("config.styx");
+
+    let engine = Arc::new(
+        tracey::daemon::Engine::new(project_root, config_path)
+            .await
+            .expect("Failed to create engine"),
+    );
+    let service = tracey::daemon::TraceyService::new(engine);
+    let rpc = common::create_test_rpc_service(service).await;
+    (temp, rpc)
+}
+
+fn rid(id: &str) -> tracey_core::RuleId {
+    parse_rule_id(id).expect("valid rule id")
 }
 
 // ============================================================================
@@ -42,10 +94,8 @@ async fn create_test_service() -> tracey::daemon::TraceyService {
 
 #[tokio::test]
 async fn test_status_returns_coverage() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let status = service.status().await;
+    let status = rpc(service.client.status().await);
 
     // We should have at least one impl
     assert!(!status.impls.is_empty(), "Expected at least one impl");
@@ -63,10 +113,8 @@ async fn test_status_returns_coverage() {
 
 #[tokio::test]
 async fn test_status_coverage_percentages() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let status = service.status().await;
+    let status = rpc(service.client.status().await);
 
     for impl_status in &status.impls {
         // Covered rules should not exceed total
@@ -93,8 +141,6 @@ async fn test_status_coverage_percentages() {
 
 #[tokio::test]
 async fn test_uncovered_returns_rules() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = UncoveredRequest {
         spec: Some("test".to_string()),
@@ -102,7 +148,7 @@ async fn test_uncovered_returns_rules() {
         prefix: None,
     };
 
-    let response = service.uncovered(req).await;
+    let response = rpc(service.client.uncovered(req).await);
 
     assert_eq!(response.spec, "test");
     assert_eq!(response.impl_name, "rust");
@@ -115,8 +161,6 @@ async fn test_uncovered_returns_rules() {
 
 #[tokio::test]
 async fn test_uncovered_with_prefix_filter() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = UncoveredRequest {
         spec: Some("test".to_string()),
@@ -124,13 +168,13 @@ async fn test_uncovered_with_prefix_filter() {
         prefix: Some("auth".to_string()),
     };
 
-    let response = service.uncovered(req).await;
+    let response = rpc(service.client.uncovered(req).await);
 
     // All returned rules should start with "auth."
     for section in &response.by_section {
         for rule in &section.rules {
             assert!(
-                rule.id.starts_with("auth."),
+                rule.id.base.starts_with("auth."),
                 "Rule {} doesn't match prefix filter",
                 rule.id
             );
@@ -140,8 +184,6 @@ async fn test_uncovered_with_prefix_filter() {
 
 #[tokio::test]
 async fn test_untested_returns_rules() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = UntestedRequest {
         spec: Some("test".to_string()),
@@ -149,7 +191,7 @@ async fn test_untested_returns_rules() {
         prefix: None,
     };
 
-    let response = service.untested(req).await;
+    let response = rpc(service.client.untested(req).await);
 
     assert_eq!(response.spec, "test");
     assert_eq!(response.impl_name, "rust");
@@ -163,15 +205,13 @@ async fn test_untested_returns_rules() {
 
 #[tokio::test]
 async fn test_rule_returns_details() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let rule = service.rule("auth.login".to_string()).await;
+    let rule = rpc(service.client.rule(rid("auth.login")).await);
 
     assert!(rule.is_some(), "Expected auth.login rule to exist");
 
     let info = rule.unwrap();
-    assert_eq!(info.id, "auth.login");
+    assert_eq!(info.id, rid("auth.login"));
     assert!(!info.raw.is_empty(), "Expected rule raw markdown");
     assert!(
         !info.coverage.is_empty(),
@@ -181,10 +221,8 @@ async fn test_rule_returns_details() {
 
 #[tokio::test]
 async fn test_rule_not_found() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let rule = service.rule("nonexistent.rule".to_string()).await;
+    let rule = rpc(service.client.rule(rid("nonexistent.rule")).await);
 
     assert!(rule.is_none(), "Expected nonexistent rule to return None");
 }
@@ -195,10 +233,8 @@ async fn test_rule_not_found() {
 
 #[tokio::test]
 async fn test_config_returns_project_info() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
-    let config = service.config().await;
+    let config = rpc(service.client.config().await);
 
     assert!(!config.specs.is_empty(), "Expected at least one spec");
 
@@ -213,28 +249,202 @@ async fn test_config_returns_project_info() {
     );
 }
 
+#[tokio::test]
+async fn test_daemon_starts_with_semantically_invalid_config() {
+    let temp = common::create_temp_project();
+    std::fs::write(
+        temp.path().join("config.styx"),
+        r#"
+specs (
+  {
+    name test
+    prefix r
+    include (spec.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+      }
+    )
+  }
+)
+"#,
+    )
+    .expect("Failed to write config");
+
+    let engine = Arc::new(
+        tracey::daemon::Engine::new(temp.path().to_path_buf(), temp.path().join("config.styx"))
+            .await
+            .expect("Engine should initialize even with invalid semantic config"),
+    );
+    let service = tracey::daemon::TraceyService::new(engine);
+    let rpc_service = common::create_test_rpc_service(service).await;
+
+    let health = rpc(rpc_service.client.health().await);
+    let config_error = health.config_error.unwrap_or_default();
+    assert!(
+        config_error.contains("deprecated `prefix r`"),
+        "Expected config error about deprecated prefix, got: {config_error}"
+    );
+
+    // Service remains responsive even when config is invalid.
+    let _status = rpc(rpc_service.client.status().await);
+}
+
+#[tokio::test]
+async fn test_reload_with_semantically_invalid_config_keeps_previous_data() {
+    let (temp, service) = create_isolated_test_service().await;
+    let before = rpc(service.client.status().await);
+    assert!(
+        !before.impls.is_empty(),
+        "Expected fixture project to have initial coverage data"
+    );
+
+    std::fs::write(
+        temp.path().join("config.styx"),
+        r#"
+specs (
+  {
+    name test
+    prefix r
+    include (spec.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+      }
+    )
+  }
+)
+"#,
+    )
+    .expect("Failed to write invalid config");
+
+    let _reload = rpc(service.client.reload().await);
+
+    let health = rpc(service.client.health().await);
+    let config_error = health.config_error.unwrap_or_default();
+    assert!(
+        config_error.contains("deprecated `prefix r`"),
+        "Expected config error about deprecated prefix, got: {config_error}"
+    );
+
+    // Last known good data remains available after failed semantic rebuild.
+    let after = rpc(service.client.status().await);
+    assert!(
+        !after.impls.is_empty(),
+        "Expected previous data to remain available after failed rebuild"
+    );
+}
+
+#[tokio::test]
+async fn test_spec_content_orders_files_by_weight_then_path() {
+    let temp = common::create_temp_project();
+    let spec_dir = temp.path().join("spec-order");
+    std::fs::create_dir_all(&spec_dir).expect("Failed to create spec-order dir");
+
+    std::fs::write(
+        spec_dir.join("02-beta.md"),
+        r#"# Beta
+
+r[order.beta]
+Beta rule.
+"#,
+    )
+    .expect("Failed to write 02-beta.md");
+
+    std::fs::write(
+        spec_dir.join("01-alpha.md"),
+        r#"# Alpha
+
+r[order.alpha]
+Alpha rule.
+"#,
+    )
+    .expect("Failed to write 01-alpha.md");
+
+    std::fs::write(
+        spec_dir.join("00-weighted.md"),
+        r#"+++
+weight = -10
++++
+
+# Weighted
+
+r[order.weighted]
+Weighted rule.
+"#,
+    )
+    .expect("Failed to write 00-weighted.md");
+
+    std::fs::write(
+        temp.path().join("config.styx"),
+        r#"
+specs (
+  {
+    name test
+    include (spec-order/*.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+      }
+    )
+  }
+)
+"#,
+    )
+    .expect("Failed to write config");
+
+    let engine = Arc::new(
+        tracey::daemon::Engine::new(temp.path().to_path_buf(), temp.path().join("config.styx"))
+            .await
+            .expect("Failed to create engine"),
+    );
+    let service = tracey::daemon::TraceyService::new(engine);
+    let rpc_service = common::create_test_rpc_service(service).await;
+
+    let spec_content = rpc(rpc_service
+        .client
+        .spec_content("test".to_string(), "rust".to_string())
+        .await)
+    .expect("Expected spec content");
+
+    assert_eq!(
+        spec_content.sections[0].source_file, "spec-order/00-weighted.md",
+        "Expected first rendered file to use lowest weight"
+    );
+
+    let titles: Vec<&str> = spec_content
+        .outline
+        .iter()
+        .map(|entry| entry.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Weighted", "Alpha", "Beta"],
+        "Expected order by weight, then lexicographically by path for equal weights"
+    );
+}
+
 // ============================================================================
 // LSP API Tests
 // ============================================================================
 
 #[tokio::test]
 async fn test_lsp_hover_on_reference() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
-    // Content with a reference to auth.login
-    let content = r#"/// r[impl auth.login]
-fn test_func() {}"#;
+    let content = std::fs::read_to_string(fixtures_dir().join("src/lib.rs")).unwrap();
 
     let req = LspPositionRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
+        path: fixtures_dir().join("src/lib.rs").display().to_string(),
         content: content.to_string(),
-        line: 0,
-        character: 12, // Position within "auth.login"
+        line: 4,      // r[impl auth.login] is on line 5 (0-indexed: 4)
+        character: 8, // Position within "auth.login"
     };
 
-    let hover = service.lsp_hover(req).await;
+    let hover = rpc(service.client.lsp_hover(req).await);
 
     assert!(hover.is_some(), "Expected hover info for auth.login");
 
@@ -245,42 +455,36 @@ fn test_func() {}"#;
 
 #[tokio::test]
 async fn test_lsp_hover_outside_reference() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
-    let content = r#"// Just a comment
-fn test_func() {}"#;
+    let content = std::fs::read_to_string(fixtures_dir().join("src/lib.rs")).unwrap();
 
     let req = LspPositionRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
+        path: fixtures_dir().join("src/lib.rs").display().to_string(),
         content: content.to_string(),
-        line: 1,
+        line: 7,      // "pub fn login..." line (0-indexed)
         character: 5, // Position in "fn"
     };
 
-    let hover = service.lsp_hover(req).await;
+    let hover = rpc(service.client.lsp_hover(req).await);
 
     assert!(hover.is_none(), "Expected no hover info outside reference");
 }
 
 #[tokio::test]
 async fn test_lsp_definition() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
-    let content = r#"/// r[impl auth.login]
-fn test_func() {}"#;
+    let content = std::fs::read_to_string(fixtures_dir().join("src/lib.rs")).unwrap();
 
     let req = LspPositionRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
+        path: fixtures_dir().join("src/lib.rs").display().to_string(),
         content: content.to_string(),
-        line: 0,
-        character: 12,
+        line: 4,      // r[impl auth.login] is on line 5 (0-indexed: 4)
+        character: 8, // inside "auth.login"
     };
 
-    let locations = service.lsp_definition(req).await;
+    let locations = rpc(service.client.lsp_definition(req).await);
 
     assert!(
         !locations.is_empty(),
@@ -295,22 +499,192 @@ fn test_func() {}"#;
 }
 
 #[tokio::test]
-async fn test_lsp_completions() {
-    use tracey_proto::TraceyDaemon;
-
+async fn test_lsp_hover_on_markdown_backtick_reference() {
     let service = create_test_service().await;
 
-    // Typing "r[impl auth" should suggest auth.* rules
-    let content = "/// r[impl auth";
-
+    let content = "See `r[auth.login]` for details.";
     let req = LspPositionRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
+        path: fixtures_dir().join("spec.md").display().to_string(),
         content: content.to_string(),
         line: 0,
-        character: 15, // After "auth"
+        character: 8, // inside auth.login
     };
 
-    let completions = service.lsp_completions(req).await;
+    let hover = rpc(service.client.lsp_hover(req).await);
+    assert!(
+        hover.is_some(),
+        "Expected hover info for markdown backtick reference"
+    );
+    assert_eq!(hover.unwrap().rule_id, rid("auth.login"));
+}
+
+#[tokio::test]
+async fn test_lsp_definition_on_markdown_backtick_reference() {
+    let service = create_test_service().await;
+
+    let content = "See `r[auth.login]` for details.";
+    let req = LspPositionRequest {
+        path: fixtures_dir().join("spec.md").display().to_string(),
+        content: content.to_string(),
+        line: 0,
+        character: 8, // inside auth.login
+    };
+
+    let locations = rpc(service.client.lsp_definition(req).await);
+    assert!(
+        !locations.is_empty(),
+        "Expected definition location for markdown backtick reference"
+    );
+    assert!(
+        locations[0].path.contains("spec.md"),
+        "Expected definition in spec.md"
+    );
+}
+
+#[tokio::test]
+async fn test_workspace_diagnostics_include_spec_coverage_hints() {
+    let service = create_test_service().await;
+
+    let all_diags = rpc(service.client.lsp_workspace_diagnostics().await);
+    let spec_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("spec.md"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
+
+    // data.format and error.logging have no implementations -> "uncovered" hints
+    let uncovered: Vec<_> = spec_diags
+        .iter()
+        .filter(|d| d.code == "uncovered")
+        .collect();
+    assert!(
+        uncovered.len() >= 2,
+        "Expected at least 2 uncovered hints (data.format, error.logging), got {}: {uncovered:?}",
+        uncovered.len()
+    );
+
+    // auth.session and auth.logout have impl but no verify -> "untested" hints
+    let untested: Vec<_> = spec_diags.iter().filter(|d| d.code == "untested").collect();
+    assert!(
+        untested.len() >= 2,
+        "Expected at least 2 untested hints (auth.session, auth.logout), got {}: {untested:?}",
+        untested.len()
+    );
+
+    // All coverage hints should be severity "hint"
+    for d in &spec_diags {
+        if d.code == "uncovered" || d.code == "untested" {
+            assert_eq!(
+                d.severity, "hint",
+                "Coverage diagnostic should be severity 'hint'"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_lsp_diagnostics_orphaned_markdown_backtick_reference() {
+    let service = create_test_service().await;
+
+    let spec_path = fixtures_dir().join("spec.md");
+    let original = std::fs::read_to_string(&spec_path).unwrap();
+    let content = format!("{original}\nSee `r[auth.typo]` for details.\n");
+
+    // Feed modified content through VFS overlay and rebuild
+    rpc(service
+        .client
+        .vfs_open(spec_path.display().to_string(), content.to_string())
+        .await);
+    rpc(service.client.reload().await);
+
+    let all_diags = rpc(service.client.lsp_workspace_diagnostics().await);
+    let spec_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("spec.md"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
+    let orphaned = spec_diags.iter().find(|d| d.code == "orphaned");
+    assert!(
+        orphaned.is_some(),
+        "Expected orphaned diagnostic for markdown backtick reference, got: {spec_diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_lsp_diagnostics_stale_markdown_backtick_reference() {
+    let temp = tempfile::tempdir().expect("Failed to create temp dir");
+    let project_root = temp.path().to_path_buf();
+
+    std::fs::create_dir_all(project_root.join("src")).expect("Failed to create src dir");
+    std::fs::write(
+        project_root.join("config.styx"),
+        r#"
+specs (
+  {
+    name test
+    include (spec.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+      }
+    )
+  }
+)
+"#,
+    )
+    .expect("Failed to write config");
+    // Spec has auth.login+2 definition AND a stale r[auth.login] backtick reference
+    std::fs::write(
+        project_root.join("spec.md"),
+        r#"
+r[auth.login+2]
+Users MUST provide valid credentials to log in.
+
+See `r[auth.login]` for details.
+"#,
+    )
+    .expect("Failed to write spec");
+    std::fs::write(project_root.join("src/lib.rs"), "// placeholder")
+        .expect("Failed to write src/lib.rs");
+
+    let engine = Arc::new(
+        tracey::daemon::Engine::new(project_root.clone(), project_root.join("config.styx"))
+            .await
+            .expect("Failed to create engine"),
+    );
+    let service = tracey::daemon::TraceyService::new(engine);
+    let rpc_service = common::create_test_rpc_service(service).await;
+
+    let all_diags = rpc(rpc_service.client.lsp_workspace_diagnostics().await);
+    let spec_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("spec.md"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
+    let stale = spec_diags.iter().find(|d| d.code == "stale");
+    assert!(
+        stale.is_some(),
+        "Expected stale diagnostic for markdown backtick reference, got: {spec_diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_lsp_completions() {
+    let service = create_test_service().await;
+
+    // Completions don't depend on build data for the file itself;
+    // they query the rule index. Use a real file path though.
+    let content = std::fs::read_to_string(fixtures_dir().join("src/lib.rs")).unwrap();
+
+    let req = LspPositionRequest {
+        path: fixtures_dir().join("src/lib.rs").display().to_string(),
+        content: content.to_string(),
+        line: 4,       // r[impl auth.login] line
+        character: 15, // After "auth" in "auth.login"
+    };
+
+    let completions = rpc(service.client.lsp_completions(req).await);
 
     // Should have some auth.* completions
     let auth_completions: Vec<_> = completions
@@ -327,51 +701,40 @@ async fn test_lsp_completions() {
 
 #[tokio::test]
 async fn test_lsp_diagnostics_orphaned_reference() {
-    use tracey_proto::TraceyDaemon;
+    let service = create_test_service_named("orphaned").await;
 
-    let service = create_test_service().await;
-
-    // Reference to non-existent rule
-    let content = r#"/// r[impl nonexistent.rule]
-fn test_func() {}"#;
-
-    let req = LspDocumentRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
-        content: content.to_string(),
-    };
-
-    let diagnostics = service.lsp_diagnostics(req).await;
+    let all_diags = rpc(service.client.lsp_workspace_diagnostics().await);
+    let src_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("src/lib.rs"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
 
     // Should have a diagnostic for the orphaned reference
-    let orphaned = diagnostics.iter().find(|d| d.code == "orphaned");
+    let orphaned = src_diags.iter().find(|d| d.code == "orphaned");
     assert!(orphaned.is_some(), "Expected orphaned diagnostic");
 }
 
 #[tokio::test]
 async fn test_lsp_document_symbols() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
-    let content = r#"/// r[impl auth.login]
-fn login() {}
-
-/// r[impl auth.session]
-struct Session {}
-
-/// r[verify auth.login]
-#[test]
-fn test_login() {}"#;
+    let content = std::fs::read_to_string(fixtures_dir().join("src/lib.rs")).unwrap();
 
     let req = LspDocumentRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
+        path: fixtures_dir().join("src/lib.rs").display().to_string(),
         content: content.to_string(),
     };
 
-    let symbols = service.lsp_document_symbols(req).await;
+    let symbols = rpc(service.client.lsp_document_symbols(req).await);
 
-    // Should have symbols for each reference
-    assert!(symbols.len() >= 3, "Expected at least 3 symbols");
+    // lib.rs has auth.login, api.fetch, auth.session, auth.logout, data.required-fields,
+    // error.codes (x2), error.messages (x2) — at least 5 unique refs
+    assert!(
+        symbols.len() >= 5,
+        "Expected at least 5 symbols, got: {}",
+        symbols.len()
+    );
 
     // Check that we have auth.login symbol
     let login_symbol = symbols.iter().find(|s| s.name == "auth.login");
@@ -384,11 +747,12 @@ fn test_login() {}"#;
 
 #[tokio::test]
 async fn test_lsp_workspace_symbols() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
-    let symbols = service.lsp_workspace_symbols("auth".to_string()).await;
+    let symbols = rpc(service
+        .client
+        .lsp_workspace_symbols("auth".to_string())
+        .await);
 
     // Should have auth.* symbols
     assert!(!symbols.is_empty(), "Expected auth.* symbols");
@@ -399,27 +763,32 @@ async fn test_lsp_workspace_symbols() {
             "Symbol {} doesn't match query 'auth'",
             symbol.name
         );
+        let path = symbol
+            .path
+            .as_deref()
+            .expect("workspace symbols should include source file path");
+        assert!(
+            path.ends_with(".md"),
+            "Expected workspace symbol path to point to markdown spec file, got: {path}"
+        );
     }
 }
 
 #[tokio::test]
 async fn test_lsp_references() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
-    let content = r#"/// r[impl auth.login]
-fn login() {}"#;
+    let content = std::fs::read_to_string(fixtures_dir().join("src/lib.rs")).unwrap();
 
     let req = LspReferencesRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
+        path: fixtures_dir().join("src/lib.rs").display().to_string(),
         content: content.to_string(),
-        line: 0,
-        character: 12,
+        line: 4, // r[impl auth.login]
+        character: 8,
         include_declaration: true,
     };
 
-    let references = service.lsp_references(req).await;
+    let references = rpc(service.client.lsp_references(req).await);
 
     // Should have at least the definition and one impl reference
     assert!(!references.is_empty(), "Expected references for auth.login");
@@ -431,19 +800,113 @@ fn login() {}"#;
 
 #[tokio::test]
 async fn test_validate_returns_results() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
     let req = ValidateRequest {
         spec: Some("test".to_string()),
         impl_name: Some("rust".to_string()),
     };
 
-    let result = service.validate(req).await;
+    let result = rpc(service.client.validate(req).await);
 
     assert_eq!(result.spec, "test");
     assert_eq!(result.impl_name, "rust");
     // The fixture has valid data, so should have no errors (or minimal)
+}
+
+#[tokio::test]
+async fn test_validate_reports_include_unparseable_files() {
+    let temp = common::create_temp_project();
+    std::fs::write(
+        temp.path().join("config.styx"),
+        r#"
+specs (
+  {
+    name test
+    include (spec.md)
+    impls (
+      {
+        name rust
+        include (
+          src/**/*.rs
+          justfile
+        )
+      }
+    )
+  }
+)
+"#,
+    )
+    .expect("Failed to write config");
+    std::fs::write(
+        temp.path().join("justfile"),
+        r#"# r[impl auth.login]
+run:
+  @echo "hello"
+"#,
+    )
+    .expect("Failed to write justfile");
+
+    let engine = Arc::new(
+        tracey::daemon::Engine::new(temp.path().to_path_buf(), temp.path().join("config.styx"))
+            .await
+            .expect("Failed to create engine"),
+    );
+    let service = tracey::daemon::TraceyService::new(engine);
+    let service = common::create_test_rpc_service(service).await;
+
+    let result = rpc(service
+        .client
+        .validate(ValidateRequest {
+            spec: Some("test".to_string()),
+            impl_name: Some("rust".to_string()),
+        })
+        .await);
+
+    let include_error = result
+        .errors
+        .iter()
+        .find(|e| e.code == ValidationErrorCode::IncludeUnparseableFile)
+        .expect("Expected IncludeUnparseableFile validation error");
+    assert!(
+        include_error.message.contains("justfile"),
+        "Expected include parse failure message to mention justfile, got: {}",
+        include_error.message
+    );
+}
+
+#[tokio::test]
+async fn test_validate_ignores_short_form_prose_unknown_prefix() {
+    let (temp, service) = create_isolated_test_service().await;
+    let prose_file = temp.path().join("src/prose.rs");
+    std::fs::write(
+        &prose_file,
+        "/// chunk[i] immediately follows, etc.\nfn prose() {}\n",
+    )
+    .expect("Failed to write prose file");
+
+    rpc(service.client.reload().await);
+
+    let result = rpc(service
+        .client
+        .validate(ValidateRequest {
+            spec: Some("test".to_string()),
+            impl_name: Some("rust".to_string()),
+        })
+        .await);
+
+    let prose_path = prose_file.display().to_string();
+    let unknown_prefix_in_prose: Vec<_> = result
+        .errors
+        .iter()
+        .filter(|e| e.code == ValidationErrorCode::UnknownPrefix)
+        .filter(|e| e.file.as_deref() == Some(prose_path.as_str()))
+        .collect();
+
+    assert!(
+        unknown_prefix_in_prose.is_empty(),
+        "Expected no UnknownPrefix errors for short-form prose in src/prose.rs, got: {:?}",
+        unknown_prefix_in_prose
+    );
 }
 
 // ============================================================================
@@ -452,23 +915,16 @@ async fn test_validate_returns_results() {
 
 #[tokio::test]
 async fn test_lsp_semantic_tokens() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
-    let content = r#"/// r[impl auth.login]
-fn login() {}
-
-/// r[verify auth.login]
-#[test]
-fn test_login() {}"#;
+    let content = std::fs::read_to_string(fixtures_dir().join("src/lib.rs")).unwrap();
 
     let req = LspDocumentRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
+        path: fixtures_dir().join("src/lib.rs").display().to_string(),
         content: content.to_string(),
     };
 
-    let tokens = service.lsp_semantic_tokens(req).await;
+    let tokens = rpc(service.client.lsp_semantic_tokens(req).await);
 
     // Should have tokens for each reference
     assert!(!tokens.is_empty(), "Expected semantic tokens");
@@ -480,25 +936,17 @@ fn test_login() {}"#;
 
 #[tokio::test]
 async fn test_lsp_code_lens() {
-    use tracey_proto::TraceyDaemon;
+    let service = create_test_service_named("defines").await;
+    let dir = fixtures_named("defines");
 
-    let service = create_test_service().await;
-
-    // Code lenses show for r[define ...] references (explicit definition verb)
-    // This is useful for defining requirements in Rust code that aren't in markdown
-    let content = r#"//! Module documentation
-//!
-//! r[define auth.login]
-//! This defines the login requirement in code.
-
-pub fn login() {}"#;
+    let content = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
 
     let req = LspDocumentRequest {
-        path: fixtures_dir().join("src/example.rs").display().to_string(),
+        path: dir.join("src/lib.rs").display().to_string(),
         content: content.to_string(),
     };
 
-    let lenses = service.lsp_code_lens(req).await;
+    let lenses = rpc(service.client.lsp_code_lens(req).await);
 
     // Should have a code lens for the auth.login definition
     assert!(
@@ -509,29 +957,27 @@ pub fn login() {}"#;
 }
 
 // ============================================================================
-// Multi-Spec Prefix Filtering Tests
-// r[verify ref.prefix.filter]
+// Multi-Spec Same-Prefix Filtering Tests
+// r[verify ref.prefix.filter+2]
 // ============================================================================
 
 #[tokio::test]
 async fn test_validate_ignores_other_spec_prefixes() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
     // @tracey:ignore-start
-    // Validate test/rust - should NOT report errors for o[...] references
-    // The fixtures/src/lib.rs has both r[impl auth.login] and o[impl api.fetch]
+    // Validate test/rust - should NOT report errors for references owned by other spec
+    // The fixtures/src/lib.rs has both r[impl auth.login] and r[impl api.fetch]
     // @tracey:ignore-end
     let req = ValidateRequest {
         spec: Some("test".to_string()),
         impl_name: Some("rust".to_string()),
     };
 
-    let result = service.validate(req).await;
+    let result = rpc(service.client.validate(req).await);
 
     // @tracey:ignore-start
-    // Should not have any UnknownRequirement errors for o[impl api.fetch]
+    // Should not have any UnknownRequirement errors for r[impl api.fetch]
     // because that reference belongs to the "other" spec, not "test"
     // @tracey:ignore-end
     let unknown_api_errors: Vec<_> = result
@@ -545,7 +991,7 @@ async fn test_validate_ignores_other_spec_prefixes() {
     assert!(
         unknown_api_errors.is_empty(),
         // @tracey:ignore-next-line
-        "Validation of test/rust should NOT report errors for o[...] references. \
+        "Validation of test/rust should NOT report errors for other-spec references. \
          Found errors: {:?}",
         unknown_api_errors
     );
@@ -553,21 +999,19 @@ async fn test_validate_ignores_other_spec_prefixes() {
 
 #[tokio::test]
 async fn test_validate_other_spec_validates_its_own_prefix() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
     // @tracey:ignore-next-line
-    // Validate other/rust - should properly validate o[...] references
+    // Validate other/rust - should properly validate its own references
     let req = ValidateRequest {
         spec: Some("other".to_string()),
         impl_name: Some("rust".to_string()),
     };
 
-    let result = service.validate(req).await;
+    let result = rpc(service.client.validate(req).await);
 
     // @tracey:ignore-start
-    // Should not have UnknownRequirement errors for o[impl api.fetch]
+    // Should not have UnknownRequirement errors for r[impl api.fetch]
     // because api.fetch exists in the other spec
     // @tracey:ignore-end
     let unknown_api_errors: Vec<_> = result
@@ -581,7 +1025,7 @@ async fn test_validate_other_spec_validates_its_own_prefix() {
     assert!(
         unknown_api_errors.is_empty(),
         // @tracey:ignore-next-line
-        "Validation of other/rust should NOT report errors for valid o[...] references. \
+        "Validation of other/rust should NOT report errors for valid api.fetch references. \
          Found errors: {:?}",
         unknown_api_errors
     );
@@ -589,8 +1033,6 @@ async fn test_validate_other_spec_validates_its_own_prefix() {
 
 #[tokio::test]
 async fn test_validate_other_spec_ignores_r_prefix() {
-    use tracey_proto::TraceyDaemon;
-
     let service = create_test_service().await;
 
     // @tracey:ignore-start
@@ -602,7 +1044,7 @@ async fn test_validate_other_spec_ignores_r_prefix() {
         impl_name: Some("rust".to_string()),
     };
 
-    let result = service.validate(req).await;
+    let result = rpc(service.client.validate(req).await);
 
     // @tracey:ignore-start
     // Should not have UnknownRequirement errors for r[impl auth.login]
@@ -626,29 +1068,307 @@ async fn test_validate_other_spec_ignores_r_prefix() {
 
 #[tokio::test]
 async fn test_validate_detects_unknown_rule_in_matching_prefix() {
-    use tracey_proto::TraceyDaemon;
+    let service = create_test_service_named("orphaned").await;
 
-    let service = create_test_service().await;
-
-    // Create a test case where a rule ID is wrong for the matching prefix
-    // We'll use the existing lsp_diagnostics to check for orphaned references
-    // in a synthetic content
-
-    // For the r[...] prefix (test spec), a reference to a non-existent rule should error
-    let content = r#"/// r[impl nonexistent.rule]
-fn test_func() {}"#;
-
-    let req = LspDocumentRequest {
-        path: fixtures_dir().join("src/test.rs").display().to_string(),
-        content: content.to_string(),
-    };
-
-    let diagnostics = service.lsp_diagnostics(req).await;
+    let all_diags = rpc(service.client.lsp_workspace_diagnostics().await);
+    let src_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("src/lib.rs"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
 
     // Should have a diagnostic for the orphaned reference
-    let orphaned = diagnostics.iter().find(|d| d.code == "orphaned");
+    let orphaned = src_diags.iter().find(|d| d.code == "orphaned");
     assert!(
         orphaned.is_some(),
         "Expected orphaned diagnostic for r[impl nonexistent.rule]"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_handles_multiple_specs_with_distinct_prefixes() {
+    let temp = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = temp.path();
+
+    std::fs::create_dir_all(root.join("src")).expect("Failed to create src dir");
+    std::fs::write(
+        root.join("config.styx"),
+        r#"
+specs (
+  {
+    name alpha
+    include (alpha-spec.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+      }
+    )
+  }
+  {
+    name beta
+    include (beta-spec.md)
+    impls (
+      {
+        name rust
+        include (src/**/*.rs)
+      }
+    )
+  }
+)
+"#,
+    )
+    .expect("Failed to write config");
+    std::fs::write(
+        root.join("alpha-spec.md"),
+        r#"
+> r[alpha.rule]
+> Alpha rule definition.
+"#,
+    )
+    .expect("Failed to write alpha spec");
+    std::fs::write(
+        root.join("beta-spec.md"),
+        r#"
+> shm[beta.rule]
+> Beta rule definition.
+"#,
+    )
+    .expect("Failed to write beta spec");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"
+// r[impl alpha.rule]
+pub fn alpha_impl() {}
+
+// shm[impl beta.rule]
+pub fn beta_impl() {}
+"#,
+    )
+    .expect("Failed to write source file");
+
+    let engine = Arc::new(
+        tracey::daemon::Engine::new(root.to_path_buf(), root.join("config.styx"))
+            .await
+            .expect("Failed to create engine"),
+    );
+    let service = tracey::daemon::TraceyService::new(engine);
+    let rpc_service = common::create_test_rpc_service(service).await;
+
+    let config = rpc(rpc_service.client.config().await);
+    let alpha = config
+        .specs
+        .iter()
+        .find(|s| s.name == "alpha")
+        .expect("Missing alpha spec");
+    let beta = config
+        .specs
+        .iter()
+        .find(|s| s.name == "beta")
+        .expect("Missing beta spec");
+    assert_eq!(alpha.prefix, "r", "alpha should infer r prefix");
+    assert_eq!(beta.prefix, "shm", "beta should infer shm prefix");
+
+    let alpha_result = rpc(rpc_service
+        .client
+        .validate(ValidateRequest {
+            spec: Some("alpha".to_string()),
+            impl_name: Some("rust".to_string()),
+        })
+        .await);
+    assert!(
+        alpha_result.errors.is_empty(),
+        "alpha/rust should validate cleanly, got: {:?}",
+        alpha_result.errors
+    );
+
+    let beta_result = rpc(rpc_service
+        .client
+        .validate(ValidateRequest {
+            spec: Some("beta".to_string()),
+            impl_name: Some("rust".to_string()),
+        })
+        .await);
+    assert!(
+        beta_result.errors.is_empty(),
+        "beta/rust should validate cleanly, got: {:?}",
+        beta_result.errors
+    );
+
+    let all_diags = rpc(rpc_service.client.lsp_workspace_diagnostics().await);
+    let src_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("src/lib.rs"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
+
+    let unknown_prefix_errors: Vec<_> = src_diags
+        .iter()
+        .filter(|d| d.code == "unknown-prefix")
+        .collect();
+    assert!(
+        unknown_prefix_errors.is_empty(),
+        "Known prefixes r/shm should not produce unknown-prefix diagnostics: {:?}",
+        unknown_prefix_errors
+    );
+}
+
+#[tokio::test]
+async fn test_config_infers_distinct_prefixes_from_nested_globs() {
+    let temp = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = temp.path();
+
+    std::fs::create_dir_all(root.join("docs/content/alpha-spec"))
+        .expect("Failed to create alpha spec dir");
+    std::fs::create_dir_all(root.join("docs/content/shm-spec"))
+        .expect("Failed to create shm spec dir");
+    std::fs::create_dir_all(root.join("rust")).expect("Failed to create rust dir");
+
+    std::fs::write(
+        root.join("config.styx"),
+        r#"
+specs (
+  {
+    name alpha
+    include (docs/content/alpha-spec/**/*.md)
+    impls (
+      {
+        name rust
+        include (rust/**/*.rs)
+      }
+    )
+  }
+  {
+    name shm
+    include (docs/content/shm-spec/**/*.md)
+    impls (
+      {
+        name rust
+        include (rust/**/*.rs)
+      }
+    )
+  }
+)
+"#,
+    )
+    .expect("Failed to write config");
+    std::fs::write(
+        root.join("docs/content/alpha-spec/_index.md"),
+        r#"
+> r[alpha.rule]
+> Alpha rule definition.
+"#,
+    )
+    .expect("Failed to write alpha spec");
+    std::fs::write(
+        root.join("docs/content/shm-spec/_index.md"),
+        r#"
+> shm[shm.rule]
+> SHM rule definition.
+"#,
+    )
+    .expect("Failed to write shm spec");
+    std::fs::write(
+        root.join("rust/lib.rs"),
+        r#"
+// r[impl alpha.rule]
+pub fn alpha_impl() {}
+
+// shm[impl shm.rule]
+pub fn shm_impl() {}
+"#,
+    )
+    .expect("Failed to write source file");
+
+    let engine = Arc::new(
+        tracey::daemon::Engine::new(root.to_path_buf(), root.join("config.styx"))
+            .await
+            .expect("Failed to create engine"),
+    );
+    let service = tracey::daemon::TraceyService::new(engine);
+    let rpc_service = common::create_test_rpc_service(service).await;
+
+    let config = rpc(rpc_service.client.config().await);
+    let alpha = config
+        .specs
+        .iter()
+        .find(|s| s.name == "alpha")
+        .expect("Missing alpha spec");
+    let shm = config
+        .specs
+        .iter()
+        .find(|s| s.name == "shm")
+        .expect("Missing shm spec");
+
+    assert_eq!(alpha.prefix, "r", "alpha should infer r prefix");
+    assert_eq!(shm.prefix, "shm", "shm should infer shm prefix");
+}
+
+// ============================================================================
+// test_include extraction
+// ============================================================================
+
+/// r[verify config.impl.test_include.extraction]
+#[tokio::test]
+async fn test_test_include_extracts_verify_annotations() {
+    let service = create_test_service_named("test-include").await;
+
+    // auth.login has a verify annotation in tests/auth_test.rs (matched by test_include only)
+    let rule = rpc(service.client.rule(rid("auth.login")).await);
+    let info = rule.expect("auth.login rule should exist");
+    let coverage = info
+        .coverage
+        .iter()
+        .find(|c| c.impl_name == "rust")
+        .expect("Expected rust impl coverage");
+    assert!(
+        !coverage.verify_refs.is_empty(),
+        "auth.login should have verify refs from test_include files, got none"
+    );
+
+    // auth.session also has a verify annotation in test_include
+    let rule = rpc(service.client.rule(rid("auth.session")).await);
+    let info = rule.expect("auth.session rule should exist");
+    let coverage = info
+        .coverage
+        .iter()
+        .find(|c| c.impl_name == "rust")
+        .expect("Expected rust impl coverage");
+    assert!(
+        !coverage.verify_refs.is_empty(),
+        "auth.session should have verify refs from test_include files, got none"
+    );
+
+    // data.validate has NO verify annotation anywhere
+    let rule = rpc(service.client.rule(rid("data.validate")).await);
+    let info = rule.expect("data.validate rule should exist");
+    let coverage = info
+        .coverage
+        .iter()
+        .find(|c| c.impl_name == "rust")
+        .expect("Expected rust impl coverage");
+    assert!(
+        coverage.verify_refs.is_empty(),
+        "data.validate should have no verify refs"
+    );
+}
+
+/// r[verify config.impl.test_include.extraction]
+#[tokio::test]
+async fn test_test_include_counts_toward_verified() {
+    let service = create_test_service_named("test-include").await;
+    let status = rpc(service.client.status().await);
+
+    let impl_status = status
+        .impls
+        .iter()
+        .find(|i| i.spec == "test" && i.impl_name == "rust")
+        .expect("Expected test/rust impl");
+
+    // auth.login and auth.session are verified via test_include
+    assert!(
+        impl_status.verified_rules >= 2,
+        "Expected at least 2 verified rules from test_include, got {}",
+        impl_status.verified_rules
     );
 }

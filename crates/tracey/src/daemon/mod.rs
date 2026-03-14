@@ -6,12 +6,19 @@
 //! over local IPC (Unix sockets on Unix, named pipes on Windows).
 //! HTTP, MCP, and LSP bridges connect as clients.
 //!
+//! ## State Directory
+//!
+//! Runtime state (socket, PID file, lock file, logs) is stored under
+//! `$XDG_STATE_HOME/tracey/<hash>` (or platform equivalent), where `<hash>`
+//! is a truncated Blake3 hash of the canonical project root path. A
+//! `project-root` metadata file inside each state dir enables reverse lookups.
+//!
 //! ## Socket Location
 //!
 //! r[impl daemon.lifecycle.socket]
 //!
-//! The daemon listens on `.tracey/daemon.sock` in the workspace root (Unix)
-//! or a named pipe derived from the workspace path (Windows).
+//! The daemon listens on `<state_dir>/daemon.sock` (Unix) or a named pipe
+//! derived from the workspace path (Windows).
 //!
 //! ## Lifecycle
 //!
@@ -25,11 +32,10 @@ pub mod service;
 pub mod watcher;
 
 use eyre::{Result, WrapErr};
-use roam_local::LocalListener;
-use roam_stream::{ConnectionError, HandshakeConfig, accept};
+use roam_stream::LocalLinkAcceptor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -44,35 +50,79 @@ pub use watcher::WatcherState as DaemonWatcherState;
 /// Default idle timeout in seconds (10 minutes)
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
-/// Socket file name within .tracey directory (Unix only)
+/// Socket file name within the state directory (Unix only)
 #[cfg(unix)]
 const SOCKET_FILENAME: &str = "daemon.sock";
 
+/// Return the base directory that contains all per-project state directories.
+///
+/// Resolved via `dirs::state_dir()` with platform-specific fallbacks
+/// (`~/.local/state` on Linux, `~/Library/Application Support` on macOS
+/// via `dirs::data_local_dir()`). Returns `{state_home}/tracey/`.
+pub fn state_base_dir() -> PathBuf {
+    let base = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .expect("could not determine home directory")
+                .join(".local/state")
+        });
+
+    base.join("tracey")
+}
+
+fn state_dir_inner(project_root: &Path) -> (PathBuf, PathBuf) {
+    let canonical =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let hash = blake3::hash(canonical.as_os_str().as_encoded_bytes());
+    let short_hash = &hash.to_hex()[..16];
+
+    (state_base_dir().join(short_hash), canonical)
+}
+
+/// Compute the per-project state directory path.
+///
+/// Returns `{state_home}/tracey/{hash}` where `hash` is the first 16 hex
+/// characters of the Blake3 hash of the canonical project root path.
+pub fn state_dir(project_root: &Path) -> PathBuf {
+    state_dir_inner(project_root).0
+}
+
+/// Create the per-project state directory and write a `project-root` metadata
+/// file for reverse lookups. Returns the directory path.
+pub fn ensure_state_dir(project_root: &Path) -> Result<PathBuf> {
+    let (dir, canonical) = state_dir_inner(project_root);
+    std::fs::create_dir_all(&dir)?;
+
+    let meta_path = dir.join("project-root");
+    std::fs::write(&meta_path, canonical.as_os_str().as_encoded_bytes())?;
+
+    Ok(dir)
+}
+
 /// Get the local IPC endpoint for a workspace.
 ///
-/// On Unix, this returns a path to `.tracey/daemon.sock`.
+/// On Unix, this returns a path to `<state_dir>/daemon.sock`.
 /// On Windows, this returns a named pipe path like `\\.\pipe\tracey-{hash}`.
 ///
 /// r[impl daemon.roam.unix-socket]
 #[cfg(unix)]
 pub fn local_endpoint(project_root: &Path) -> PathBuf {
-    project_root.join(".tracey").join(SOCKET_FILENAME)
+    state_dir(project_root).join(SOCKET_FILENAME)
 }
 
 /// Get the local IPC endpoint for a workspace.
 ///
-/// On Unix, this returns a path to `.tracey/daemon.sock`.
+/// On Unix, this returns a path to `<state_dir>/daemon.sock`.
 /// On Windows, this returns a named pipe path like `\\.\pipe\tracey-{hash}`.
 #[cfg(windows)]
 pub fn local_endpoint(project_root: &Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    project_root.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    format!(r"\\.\pipe\tracey-{:016x}", hash)
+    let dir = state_dir(project_root);
+    let hash = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("state_dir hash");
+    format!(r"\\.\pipe\tracey-{hash}")
 }
 
 /// Legacy alias for `local_endpoint` (Unix only).
@@ -81,41 +131,83 @@ pub fn socket_path(project_root: &Path) -> PathBuf {
     local_endpoint(project_root)
 }
 
-/// Ensure the .tracey directory exists and is gitignored.
-pub fn ensure_tracey_dir(project_root: &Path) -> Result<PathBuf> {
-    let dir = project_root.join(".tracey");
-    std::fs::create_dir_all(&dir)?;
+/// Path to the daemon PID file within the state directory.
+pub fn pid_file_path(project_root: &Path) -> PathBuf {
+    state_dir(project_root).join("daemon.pid")
+}
 
-    // Ensure .tracey/ is in .gitignore
-    let gitignore_path = project_root.join(".gitignore");
-    let needs_entry = if gitignore_path.exists() {
-        let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
-        !content.lines().any(|line| {
-            let trimmed = line.trim();
-            trimmed == ".tracey" || trimmed == ".tracey/" || trimmed == "/.tracey/"
-        })
-    } else {
-        true
+/// Check whether a process with the given PID is alive.
+#[cfg(unix)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    // Signal 0 doesn't send a signal; it just checks whether the process exists.
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+/// Check whether a process with the given PID is alive.
+#[cfg(not(unix))]
+pub fn is_pid_alive(_pid: u32) -> bool {
+    true // best-effort on non-Unix; rely on socket connect to detect dead daemon
+}
+
+/// Read a PID file at the given path and return `(pid, protocol_version)` if it
+/// parses correctly. Returns `None` if the file doesn't exist or is malformed.
+pub fn read_pid_file_at(path: &Path) -> Option<(u32, u32)> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!("Failed to read PID file {}: {e}", path.display());
+            return None;
+        }
     };
 
-    if needs_entry {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&gitignore_path)?;
-        // Add newline before if file exists and doesn't end with newline
-        if gitignore_path.exists() {
-            let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
-            if !content.is_empty() && !content.ends_with('\n') {
-                writeln!(file)?;
-            }
+    let mut pid = None;
+    let mut version = None;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("pid=") {
+            pid = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("version=") {
+            version = v.parse().ok();
         }
-        writeln!(file, ".tracey/")?;
-        info!("Added .tracey/ to .gitignore");
     }
 
-    Ok(dir)
+    match (pid, version) {
+        (Some(p), Some(v)) => Some((p, v)),
+        _ => {
+            warn!(
+                "PID file {} has unexpected format, ignoring it",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// RAII guard that writes the PID file on creation and removes it on drop.
+struct PidFile {
+    path: PathBuf,
+}
+
+impl PidFile {
+    fn create(project_root: &Path) -> Result<Self> {
+        let path = pid_file_path(project_root);
+        let content = format!(
+            "pid={}\nversion={}\n",
+            std::process::id(),
+            tracey_proto::PROTOCOL_VERSION
+        );
+        std::fs::write(&path, content)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Run the daemon for the given workspace.
@@ -127,20 +219,30 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
     // r[impl daemon.logs.file]
     info!("Starting tracey daemon for {}", project_root.display());
 
-    // Ensure .tracey directory exists
-    ensure_tracey_dir(&project_root)?;
+    // Ensure state directory exists
+    ensure_state_dir(&project_root)?;
+
+    // Write PID file; it is removed automatically when this guard drops.
+    let _pid_file = PidFile::create(&project_root)?;
 
     // Get local IPC endpoint
     let endpoint = local_endpoint(&project_root);
 
     // r[impl daemon.lifecycle.stale-socket]
-    // Remove stale endpoint if it exists (no-op on Windows)
+    // Remove stale endpoint if it exists; if it's alive, fail fast instead.
     if roam_local::endpoint_exists(&endpoint) {
-        #[cfg(unix)]
-        info!("Removing stale socket at {}", endpoint.display());
-        #[cfg(windows)]
-        info!("Removing stale endpoint");
-        let _ = roam_local::remove_endpoint(&endpoint);
+        if roam_local::connect(&endpoint).await.is_ok() {
+            #[cfg(unix)]
+            eyre::bail!("Daemon already running at {}", endpoint.display());
+            #[cfg(windows)]
+            eyre::bail!("Daemon already running");
+        } else {
+            #[cfg(unix)]
+            info!("Removing stale socket at {}", endpoint.display());
+            #[cfg(windows)]
+            info!("Removing stale endpoint");
+            let _ = roam_local::remove_endpoint(&endpoint);
+        }
     }
 
     // Create engine
@@ -210,6 +312,8 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
         // r[impl server.watch.respect-gitignore]
         // Build gitignore matcher for filtering file watcher events
         let mut gitignore = build_gitignore(&project_root_for_rebuild);
+        let canonical_project_root = std::fs::canonicalize(&project_root_for_rebuild)
+            .unwrap_or_else(|_| project_root_for_rebuild.clone());
 
         while let Some(event) = watcher_rx.recv().await {
             match event {
@@ -221,9 +325,7 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                     debug!("Rebuilt gitignore matcher");
 
                     // Trigger rebuild (watcher reconfiguration happens in the watcher thread)
-                    if let Err(e) = engine_for_rebuild.rebuild().await {
-                        error!("Rebuild failed: {}", e);
-                    }
+                    engine_for_rebuild.schedule_rebuild_with_changes(&[]).await;
                 }
 
                 WatcherEvent::FilesChanged(events) => {
@@ -266,9 +368,19 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                     }
 
                     // Filter changed files
-                    let relative_paths: Vec<_> = changed_files
+                    let relative_paths: Vec<PathBuf> = changed_files
                         .iter()
-                        .filter_map(|p| p.strip_prefix(&project_root_for_rebuild).ok())
+                        .filter_map(|p| {
+                            if let Ok(rel) = p.strip_prefix(&project_root_for_rebuild) {
+                                return Some(rel.to_path_buf());
+                            }
+                            let canonical = p.canonicalize().ok()?;
+                            canonical
+                                .strip_prefix(&canonical_project_root)
+                                .ok()
+                                .map(Path::to_path_buf)
+                        })
+                        .filter(|p| !is_temporary_edit_artifact(p))
                         .filter(|p| {
                             // Keep paths that are NOT ignored by gitignore
                             let full_path = project_root_for_rebuild.join(p);
@@ -277,12 +389,12 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                                 .is_ignore()
                         })
                         .filter(|p| {
-                            let path_str = p.to_string_lossy();
-
                             // r[impl server.watch.respect-excludes]
                             // Reject paths that match exclude patterns
                             for pattern in &exclude_patterns {
-                                if crate::data::glob_match(&path_str, pattern.as_str()) {
+                                if let Ok(glob) = globset::Glob::new(pattern.as_str())
+                                    && glob.compile_matcher().is_match(p)
+                                {
                                     return false;
                                 }
                             }
@@ -294,7 +406,9 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                                 return true;
                             }
                             for pattern in &include_patterns {
-                                if crate::data::glob_match(&path_str, pattern.as_str()) {
+                                if let Ok(glob) = globset::Glob::new(pattern.as_str())
+                                    && glob.compile_matcher().is_match(p)
+                                {
                                     return true;
                                 }
                             }
@@ -333,9 +447,13 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                         );
                     }
 
-                    if let Err(e) = engine_for_rebuild.rebuild().await {
-                        error!("Rebuild failed: {}", e);
-                    }
+                    let changed_abs: Vec<PathBuf> = relative_paths
+                        .iter()
+                        .map(|p| project_root_for_rebuild.join(p))
+                        .collect();
+                    engine_for_rebuild
+                        .schedule_rebuild_with_changes(&changed_abs)
+                        .await;
                 }
             }
         }
@@ -344,23 +462,19 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
     // Bind local IPC listener
     // Note: on Windows, accept() takes &mut self (to swap server instances)
     #[cfg(unix)]
-    let listener = LocalListener::bind(&endpoint)
+    let listener = LocalLinkAcceptor::bind(endpoint.to_string_lossy().to_string())
         .wrap_err_with(|| format!("Failed to bind socket at {}", endpoint.display()))?;
     #[cfg(windows)]
-    let mut listener =
-        LocalListener::bind(&endpoint).wrap_err_with(|| "Failed to bind named pipe")?;
+    let listener =
+        LocalLinkAcceptor::bind(&endpoint).wrap_err_with(|| "Failed to bind named pipe")?;
 
     #[cfg(unix)]
     info!("Daemon listening on {}", endpoint.display());
     #[cfg(windows)]
     info!("Daemon listening on {}", endpoint);
 
-    // Default handshake configuration
-    let handshake_config = HandshakeConfig::default();
-
     // r[impl daemon.lifecycle.idle-timeout]
-    // Track active connections and last activity for idle timeout
-    let active_connections = Arc::new(AtomicUsize::new(0));
+    // Track last activity for idle timeout
     let last_activity = Arc::new(AtomicU64::new(
         Instant::now().elapsed().as_secs(), // Will be updated on each connection
     ));
@@ -385,53 +499,40 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
             Ok(Ok(stream)) => {
                 // Update last activity
                 last_activity.store(start_time.elapsed().as_secs(), Ordering::Relaxed);
-                active_connections.fetch_add(1, Ordering::Relaxed);
-
-                info!(
-                    "New connection accepted (active: {})",
-                    active_connections.load(Ordering::Relaxed)
-                );
+                info!("New connection accepted");
 
                 let service = service.clone();
-                let config = handshake_config.clone();
-                let active_connections = Arc::clone(&active_connections);
                 let last_activity = Arc::clone(&last_activity);
 
                 tokio::spawn(async move {
                     // Create dispatcher (wraps service with generated dispatch + tracing)
                     let dispatcher = TraceyDaemonDispatcher::new(service);
+                    let (session_task_tx, session_task_rx) =
+                        tokio::sync::oneshot::channel::<tokio::task::JoinHandle<()>>();
 
-                    // Accept connection with roam-stream (handles framing and hello exchange)
-                    match accept(stream, config, dispatcher).await {
-                        Ok((_handle, _incoming, driver)) => {
+                    match roam::acceptor(stream)
+                        .spawn_fn(move |fut| {
+                            let handle = tokio::spawn(fut);
+                            let _ = session_task_tx.send(handle);
+                        })
+                        .establish::<tracey_proto::TraceyDaemonClient>(dispatcher)
+                        .await
+                    {
+                        Ok((client_guard, session_handle)) => {
                             info!("Connection established");
-                            // Run the driver (handles all RPC dispatch)
-                            if let Err(e) = driver.run().await {
-                                match e {
-                                    ConnectionError::Closed => {
-                                        info!("Connection closed cleanly");
-                                    }
-                                    ConnectionError::ProtocolViolation { rule_id, .. } => {
-                                        warn!("Protocol violation: {}", rule_id);
-                                    }
-                                    ConnectionError::Io(e) => {
-                                        error!("IO error: {}", e);
-                                    }
-                                    ConnectionError::Dispatch(e) => {
-                                        error!("Dispatch error: {}", e);
-                                    }
-                                }
+                            let _client_guard = client_guard;
+                            let _session_handle = session_handle;
+                            if let Ok(session_task) = session_task_rx.await {
+                                let _ = session_task.await;
                             }
                         }
                         Err(e) => {
-                            error!("Connection setup failed: {:?}", e);
+                            error!("Connection setup failed: {}", e);
                         }
                     }
 
-                    // Connection done, update counters
-                    let remaining = active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
                     last_activity.store(start_time.elapsed().as_secs(), Ordering::Relaxed);
-                    info!("Connection closed (active: {})", remaining);
+                    info!("Connection closed");
                 });
             }
             Ok(Err(e)) => {
@@ -439,18 +540,15 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
             }
             Err(_) => {
                 // Timeout - check if we should exit due to idle
-                let current_connections = active_connections.load(Ordering::Relaxed);
-                if current_connections == 0 {
-                    let last = last_activity.load(Ordering::Relaxed);
-                    let now = start_time.elapsed().as_secs();
-                    let idle_secs = now.saturating_sub(last);
+                let last = last_activity.load(Ordering::Relaxed);
+                let now = start_time.elapsed().as_secs();
+                let idle_secs = now.saturating_sub(last);
 
-                    if idle_secs >= DEFAULT_IDLE_TIMEOUT_SECS {
-                        info!("No connections for {} seconds, shutting down", idle_secs);
-                        // Clean up endpoint
-                        let _ = roam_local::remove_endpoint(&endpoint);
-                        return Ok(());
-                    }
+                if idle_secs >= DEFAULT_IDLE_TIMEOUT_SECS {
+                    info!("No connections for {} seconds, shutting down", idle_secs);
+                    // Clean up endpoint
+                    let _ = roam_local::remove_endpoint(&endpoint);
+                    return Ok(());
                 }
             }
         }
@@ -476,6 +574,43 @@ fn build_gitignore(project_root: &Path) -> ignore::gitignore::Gitignore {
         warn!("Failed to build gitignore matcher: {}", e);
         ignore::gitignore::Gitignore::empty()
     })
+}
+
+fn is_temporary_edit_artifact(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    if path_str.contains(".tmp.") {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.contains(".tmp.")
+        || name.ends_with(".tmp")
+        || name.ends_with('~')
+        || name.ends_with(".swp")
+        || name.ends_with(".swo")
+        || name.ends_with(".swx")
+        || name.starts_with(".#")
+}
+
+fn path_triggers_reconfigure(path: &Path, config_path: &Path, gitignore_path: &Path) -> bool {
+    if path == config_path || path == gitignore_path {
+        return true;
+    }
+
+    // Some watcher backends report parent directories instead of exact files.
+    if config_path.starts_with(path) || gitignore_path.starts_with(path) {
+        return true;
+    }
+
+    // Editors often save via temp files + rename inside `.config/tracey/`.
+    if let Some(config_dir) = config_path.parent()
+        && path.starts_with(config_dir)
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Run the smart file watcher, sending events to the channel.
@@ -532,7 +667,7 @@ async fn run_smart_watcher(
                 reconfigure_paths_for_handler.lock().unwrap().clone();
             let needs_reconfigure = paths
                 .iter()
-                .any(|p| p == &config_path || p == &gitignore_path);
+                .any(|p| path_triggers_reconfigure(p, &config_path, &gitignore_path));
 
             let watcher_event = if needs_reconfigure {
                 debug!("Config or gitignore changed, sending Reconfigure event");
@@ -623,4 +758,56 @@ pub async fn connect(project_root: &Path) -> Result<roam_local::LocalStream> {
     roam_local::connect(&endpoint)
         .await
         .wrap_err_with(|| format!("Failed to connect to daemon at {}", endpoint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_triggers_reconfigure;
+    use std::path::Path;
+
+    #[test]
+    fn reconfigure_triggers_for_exact_paths() {
+        let config = Path::new("/repo/.config/tracey/config.styx");
+        let gitignore = Path::new("/repo/.gitignore");
+        assert!(path_triggers_reconfigure(config, config, gitignore));
+        assert!(path_triggers_reconfigure(gitignore, config, gitignore));
+    }
+
+    #[test]
+    fn reconfigure_triggers_for_parent_directories() {
+        let config = Path::new("/repo/.config/tracey/config.styx");
+        let gitignore = Path::new("/repo/.gitignore");
+        assert!(path_triggers_reconfigure(
+            Path::new("/repo/.config/tracey"),
+            config,
+            gitignore
+        ));
+        assert!(path_triggers_reconfigure(
+            Path::new("/repo"),
+            config,
+            gitignore
+        ));
+    }
+
+    #[test]
+    fn reconfigure_triggers_for_temp_files_in_config_dir() {
+        let config = Path::new("/repo/.config/tracey/config.styx");
+        let gitignore = Path::new("/repo/.gitignore");
+        assert!(path_triggers_reconfigure(
+            Path::new("/repo/.config/tracey/.config.styx.tmp"),
+            config,
+            gitignore
+        ));
+    }
+
+    #[test]
+    fn reconfigure_ignores_unrelated_paths() {
+        let config = Path::new("/repo/.config/tracey/config.styx");
+        let gitignore = Path::new("/repo/.gitignore");
+        assert!(!path_triggers_reconfigure(
+            Path::new("/repo/src/lib.rs"),
+            config,
+            gitignore
+        ));
+    }
 }

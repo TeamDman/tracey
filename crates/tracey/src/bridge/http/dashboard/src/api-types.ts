@@ -31,13 +31,35 @@ export interface ValidationError {
   /**
    * Related rule IDs (for dependency errors)
    */
-  relatedRules: string[];
+  relatedRules?: RuleId[];
+  /**
+   * The referenced rule ID (for StaleRequirement/UnknownRequirement errors)
+   */
+  referenceRuleId?: RuleId;
+  /**
+   * Original annotation text for unknown references (for example `r[impl auth.logn]`).
+   */
+  referenceText?: string;
+}
+
+/**
+ * Structured rule ID representation.
+ */
+export interface RuleId {
+  /**
+   * Base rule ID without version suffix.
+   */
+  base: string;
+  /**
+   * Normalized version number (unversioned IDs are version 1).
+   */
+  version: number;
 }
 
 /**
  * Error codes for validation errors
  */
-export type ValidationErrorCode = "circular_dependency" | "invalid_naming" | "unknown_requirement" | "duplicate_requirement" | "unknown_prefix" | "impl_in_test_file";
+export type ValidationErrorCode = "circular_dependency" | "invalid_naming" | "unknown_requirement" | "stale_requirement" | "duplicate_requirement" | "unknown_prefix" | "impl_in_test_file" | "include_unparseable_file";
 
 /**
  * Validation results for a spec/implementation pair
@@ -78,6 +100,10 @@ export interface ApiSpecData {
    * Outline with coverage info
    */
   outline: OutlineEntry[];
+  /**
+   * HTML snippets to inject into the page head (e.g. mermaid.js loader)
+   */
+  head_injections?: string[];
 }
 
 /**
@@ -205,7 +231,7 @@ export interface ApiCodeRef {
 }
 
 export interface ApiRule {
-  id: string;
+  id: RuleId;
   /**
    * Raw markdown source (without r[...] marker, but with `>` prefixes for blockquote rules)
    */
@@ -230,6 +256,27 @@ export interface ApiRule {
   implRefs: ApiCodeRef[];
   verifyRefs: ApiCodeRef[];
   dependsRefs: ApiCodeRef[];
+  /**
+   * True if any reference to this rule is stale (points to an older version).
+   * A stale rule is not counted as covered.
+   */
+  isStale?: boolean;
+  /**
+   * Stale references pointing to older versions of this rule.
+   */
+  staleRefs?: ApiStaleRef[];
+}
+
+/**
+ * A stale reference: code points to an older version of a rule.
+ */
+export interface ApiStaleRef {
+  file: string;
+  line: number;
+  /**
+   * The rule ID referenced in code (older version)
+   */
+  reference_id: RuleId;
 }
 
 export interface ApiSpecForward {

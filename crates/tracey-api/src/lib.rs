@@ -5,6 +5,7 @@
 //! definitions via facet-typescript.
 
 use facet::Facet;
+use tracey_core::RuleId;
 
 /// Git status for a file
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Facet)]
@@ -65,7 +66,7 @@ pub struct ApiSpecForward {
 #[derive(Debug, Clone, Facet)]
 #[facet(rename_all = "camelCase")]
 pub struct ApiRule {
-    pub id: String,
+    pub id: RuleId,
     /// Raw markdown source (without r[...] marker, but with `>` prefixes for blockquote rules)
     pub raw: String,
     /// Rendered HTML (for dashboard display)
@@ -89,12 +90,28 @@ pub struct ApiRule {
     pub impl_refs: Vec<ApiCodeRef>,
     pub verify_refs: Vec<ApiCodeRef>,
     pub depends_refs: Vec<ApiCodeRef>,
+    /// True if any reference to this rule is stale (points to an older version).
+    /// A stale rule is not counted as covered.
+    #[facet(default)]
+    pub is_stale: bool,
+    /// Stale references pointing to older versions of this rule.
+    #[facet(default)]
+    pub stale_refs: Vec<ApiStaleRef>,
 }
 
 #[derive(Debug, Clone, Facet)]
 pub struct ApiCodeRef {
     pub file: String,
     pub line: usize,
+}
+
+/// A stale reference: code points to an older version of a rule.
+#[derive(Debug, Clone, Facet)]
+pub struct ApiStaleRef {
+    pub file: String,
+    pub line: usize,
+    /// The rule ID referenced in code (older version)
+    pub reference_id: RuleId,
 }
 
 /// Reverse traceability: file tree with coverage info
@@ -190,6 +207,9 @@ pub struct ApiSpecData {
     pub sections: Vec<SpecSection>,
     /// Outline with coverage info
     pub outline: Vec<OutlineEntry>,
+    /// HTML snippets to inject into the page head (e.g. mermaid.js loader)
+    #[facet(default)]
+    pub head_injections: Vec<String>,
 }
 
 // ============================================================================
@@ -218,7 +238,13 @@ pub struct ValidationError {
     pub column: Option<usize>,
     /// Related rule IDs (for dependency errors)
     #[facet(default)]
-    pub related_rules: Vec<String>,
+    pub related_rules: Vec<RuleId>,
+    /// The referenced rule ID (for StaleRequirement/UnknownRequirement errors)
+    #[facet(default)]
+    pub reference_rule_id: Option<RuleId>,
+    /// Original annotation text for unknown references (for example `r[impl auth.logn]`).
+    #[facet(default)]
+    pub reference_text: Option<String>,
 }
 
 /// Error codes for validation errors
@@ -232,12 +258,16 @@ pub enum ValidationErrorCode {
     InvalidNaming,
     /// Unknown requirement ID referenced
     UnknownRequirement,
+    /// Reference points to an older requirement version
+    StaleRequirement,
     /// Duplicate requirement ID in the same spec
     DuplicateRequirement,
     /// Unknown prefix in reference
     UnknownPrefix,
     /// Impl annotation in test file (only verify allowed)
     ImplInTestFile,
+    /// File matched by include/test_include could not be parsed
+    IncludeUnparseableFile,
 }
 
 /// Validation results for a spec/implementation pair

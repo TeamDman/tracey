@@ -6,10 +6,15 @@
 
 use facet::Facet;
 use roam::Tx;
-use roam::prelude::*;
+use tracey_core::RuleId;
 
 // Re-export API types for convenience
 pub use tracey_api::*;
+
+/// Protocol version — bump this whenever any RPC method is added, removed, or changed.
+/// The daemon writes this into its PID file; connectors compare it before connecting
+/// to detect stale daemons running an incompatible build.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // ============================================================================
 // Request/Response types for the TraceyDaemon service
@@ -53,7 +58,7 @@ pub struct SectionRules {
 /// Reference to a rule
 #[derive(Debug, Clone, Facet)]
 pub struct RuleRef {
-    pub id: String,
+    pub id: RuleId,
     #[facet(default)]
     pub text: Option<String>,
 }
@@ -79,6 +84,47 @@ pub struct UntestedResponse {
     pub total_rules: usize,
     pub untested_count: usize,
     pub by_section: Vec<SectionRules>,
+}
+
+/// Request for stale references query
+#[derive(Debug, Clone, Facet)]
+#[facet(rename_all = "camelCase")]
+pub struct StaleRequest {
+    /// Spec name (optional if only one spec configured)
+    #[facet(default)]
+    pub spec: Option<String>,
+    /// Implementation name (optional if only one impl configured)
+    #[facet(default)]
+    pub impl_name: Option<String>,
+    /// Filter rules by ID prefix (case-insensitive)
+    #[facet(default)]
+    pub prefix: Option<String>,
+}
+
+/// Response for stale references query
+#[derive(Debug, Clone, Facet)]
+#[facet(rename_all = "camelCase")]
+pub struct StaleResponse {
+    pub spec: String,
+    pub impl_name: String,
+    pub total_rules: usize,
+    pub stale_count: usize,
+    /// Flat list of stale entries (sorted by file, then line)
+    pub refs: Vec<StaleEntry>,
+}
+
+/// A single stale reference entry
+#[derive(Debug, Clone, Facet)]
+#[facet(rename_all = "camelCase")]
+pub struct StaleEntry {
+    /// Current rule ID (latest version in the spec)
+    pub current_id: RuleId,
+    /// File containing the stale reference
+    pub file: String,
+    /// Line number of the stale reference
+    pub line: usize,
+    /// The rule ID referenced in code (older version)
+    pub reference_id: RuleId,
 }
 
 /// Request for unmapped code query
@@ -144,7 +190,11 @@ pub struct ImplStatus {
     pub spec: String,
     pub impl_name: String,
     pub total_rules: usize,
+    /// Rules with at least one exact implementation reference (not stale).
     pub covered_rules: usize,
+    /// Rules where any reference is stale (points to an older rule version).
+    /// Not included in covered_rules. covered_rules + stale_rules + uncovered = total.
+    pub stale_rules: usize,
     pub verified_rules: usize,
 }
 
@@ -152,7 +202,7 @@ pub struct ImplStatus {
 #[derive(Debug, Clone, Facet)]
 #[facet(rename_all = "camelCase")]
 pub struct RuleInfo {
-    pub id: String,
+    pub id: RuleId,
     /// Raw markdown source (without r[...] marker, but with `>` prefixes for blockquote rules)
     pub raw: String,
     pub html: String,
@@ -162,6 +212,10 @@ pub struct RuleInfo {
     pub source_line: Option<usize>,
     /// Coverage across all implementations
     pub coverage: Vec<RuleCoverage>,
+    /// Diff from the previous rule version (N-1 → N), if version > 1 and git history is available.
+    /// Inline markdown format: ~~removed~~ / **added**.
+    #[facet(default)]
+    pub version_diff: Option<String>,
 }
 
 /// Coverage of a rule in a specific implementation
@@ -290,14 +344,14 @@ pub struct DeltaSummary {
     /// Rules that became covered
     pub newly_covered: Vec<CoverageChange>,
     /// Rules that became uncovered
-    pub newly_uncovered: Vec<String>,
+    pub newly_uncovered: Vec<RuleId>,
 }
 
 /// A change in coverage status
 #[derive(Debug, Clone, Facet)]
 #[facet(rename_all = "camelCase")]
 pub struct CoverageChange {
-    pub rule_id: String,
+    pub rule_id: RuleId,
     pub file: String,
     pub line: usize,
 }
@@ -337,7 +391,7 @@ pub struct HoverRef {
 #[facet(rename_all = "camelCase")]
 pub struct HoverInfo {
     /// Rule ID
-    pub rule_id: String,
+    pub rule_id: RuleId,
     /// Raw markdown source (without r[...] marker)
     pub raw: String,
     /// Spec name this rule belongs to
@@ -363,6 +417,10 @@ pub struct HoverInfo {
     pub range_start_char: u32,
     pub range_end_line: u32,
     pub range_end_char: u32,
+    /// Diff between a previous rule version and the current one (inline markdown format).
+    /// Present for tail annotations (current version, version > 1) and stale annotations.
+    #[facet(default)]
+    pub version_diff: Option<String>,
 }
 
 /// A completion item
@@ -419,6 +477,9 @@ pub struct LspSymbol {
     pub name: String,
     /// Kind: "definition", "impl", "verify", etc.
     pub kind: String,
+    /// Source file path for the symbol, relative to project root when available
+    #[facet(default)]
+    pub path: Option<String>,
     /// Range
     pub start_line: u32,
     pub start_char: u32,
@@ -579,7 +640,7 @@ pub struct LspDocumentRequest {
 ///
 /// This service is exposed by the daemon over a Unix socket. Bridges (HTTP, MCP, LSP)
 /// connect as clients and translate their protocols to/from these RPC calls.
-#[service]
+#[roam::service]
 pub trait TraceyDaemon {
     // === Core Queries ===
 
@@ -592,11 +653,14 @@ pub trait TraceyDaemon {
     /// Get untested rules (rules with impl but no verify references)
     async fn untested(&self, req: UntestedRequest) -> UntestedResponse;
 
+    /// Get stale references (code pointing to older rule versions)
+    async fn stale(&self, req: StaleRequest) -> StaleResponse;
+
     /// Get unmapped code (code units without requirement references)
     async fn unmapped(&self, req: UnmappedRequest) -> UnmappedResponse;
 
     /// Get details for a specific rule by ID
-    async fn rule(&self, rule_id: String) -> Option<RuleInfo>;
+    async fn rule(&self, rule_id: RuleId) -> Option<RuleInfo>;
 
     // === Configuration ===
 
@@ -675,9 +739,6 @@ pub trait TraceyDaemon {
 
     /// Get completions for a position
     async fn lsp_completions(&self, req: LspPositionRequest) -> Vec<LspCompletionItem>;
-
-    /// Get diagnostics for a file
-    async fn lsp_diagnostics(&self, req: LspDocumentRequest) -> Vec<LspDiagnostic>;
 
     /// Get diagnostics for all files in the workspace
     ///
