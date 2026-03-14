@@ -186,6 +186,16 @@ pub fn read_pid_file_at(path: &Path) -> Option<(u32, u32)> {
     }
 }
 
+#[cfg(windows)]
+fn is_busy_endpoint_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(231)
+}
+
+#[cfg(not(windows))]
+fn is_busy_endpoint_error(_error: &std::io::Error) -> bool {
+    false
+}
+
 /// RAII guard that writes the PID file on creation and removes it on drop.
 struct PidFile {
     path: PathBuf,
@@ -199,8 +209,36 @@ impl PidFile {
             std::process::id(),
             tracey_proto::PROTOCOL_VERSION
         );
-        std::fs::write(&path, content)?;
-        Ok(Self { path })
+
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+
+                    file.write_all(content.as_bytes())?;
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = match read_pid_file_at(&path) {
+                        Some((pid, _version)) => !is_pid_alive(pid),
+                        None => true,
+                    };
+
+                    if stale {
+                        warn!("Removing stale PID file at {}", path.display());
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+
+                    eyre::bail!("Daemon PID file already exists at {}", path.display());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 }
 
@@ -222,28 +260,38 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
     // Ensure state directory exists
     ensure_state_dir(&project_root)?;
 
-    // Write PID file; it is removed automatically when this guard drops.
-    let _pid_file = PidFile::create(&project_root)?;
-
     // Get local IPC endpoint
     let endpoint = local_endpoint(&project_root);
 
     // r[impl daemon.lifecycle.stale-socket]
     // Remove stale endpoint if it exists; if it's alive, fail fast instead.
     if roam_local::endpoint_exists(&endpoint) {
-        if roam_local::connect(&endpoint).await.is_ok() {
-            #[cfg(unix)]
-            eyre::bail!("Daemon already running at {}", endpoint.display());
-            #[cfg(windows)]
-            eyre::bail!("Daemon already running");
-        } else {
-            #[cfg(unix)]
-            info!("Removing stale socket at {}", endpoint.display());
-            #[cfg(windows)]
-            info!("Removing stale endpoint");
-            let _ = roam_local::remove_endpoint(&endpoint);
+        match roam_local::connect(&endpoint).await {
+            Ok(_) => {
+                #[cfg(unix)]
+                eyre::bail!("Daemon already running at {}", endpoint.display());
+                #[cfg(windows)]
+                eyre::bail!("Daemon already running");
+            }
+            Err(e) if is_busy_endpoint_error(&e) => {
+                #[cfg(unix)]
+                eyre::bail!("Daemon already running at {}", endpoint.display());
+                #[cfg(windows)]
+                eyre::bail!("Daemon already running");
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                info!("Removing stale socket at {}", endpoint.display());
+                #[cfg(windows)]
+                info!("Removing stale endpoint");
+                let _ = roam_local::remove_endpoint(&endpoint);
+            }
         }
     }
+
+    // Write PID file after confirming there is no live daemon already bound.
+    // It is removed automatically when this guard drops.
+    let _pid_file = PidFile::create(&project_root)?;
 
     // Create engine
     let engine = Arc::new(

@@ -35,6 +35,32 @@ async fn connect_local_endpoint(endpoint: &str) -> io::Result<roam_stream::Local
     roam_stream::LocalLink::connect(endpoint).await
 }
 
+#[cfg(windows)]
+fn is_transient_live_daemon_connect_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(231)
+}
+
+#[cfg(not(windows))]
+fn is_transient_live_daemon_connect_error(_error: &io::Error) -> bool {
+    false
+}
+
+fn live_daemon_busy_timeout_error(
+    pid: u32,
+    endpoint: &impl std::fmt::Debug,
+    wait_for: Duration,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "Daemon PID {} is alive but endpoint {:?} stayed busy for {}s",
+            pid,
+            endpoint,
+            wait_for.as_secs()
+        ),
+    )
+}
+
 impl DaemonClient {
     async fn connect_inner(&self) -> io::Result<roam_stream::LocalLink> {
         let start = Instant::now();
@@ -614,6 +640,7 @@ impl DaemonConnector {
                         Err(e) => {
                             let age = pid_file_age(&self.project_root);
                             let startup_grace = Duration::from_secs(20);
+                            let busy_grace = Duration::from_secs(5);
                             if let Some(age) = age
                                 && age < startup_grace
                             {
@@ -628,6 +655,24 @@ impl DaemonConnector {
                                 {
                                     return Ok(stream);
                                 }
+                            }
+
+                            if is_transient_live_daemon_connect_error(&e) {
+                                debug!(
+                                    "Daemon PID {} alive but endpoint temporarily busy ({}); waiting {:?}",
+                                    pid, e, busy_grace
+                                );
+                                if let Some(stream) = self
+                                    .wait_for_existing_daemon(pid, &endpoint, busy_grace)
+                                    .await?
+                                {
+                                    return Ok(stream);
+                                }
+                                return Err(live_daemon_busy_timeout_error(
+                                    pid,
+                                    &endpoint,
+                                    busy_grace,
+                                ));
                             }
 
                             warn!(
@@ -673,15 +718,33 @@ impl DaemonConnector {
 
         // Re-check: another process may have started the daemon while we waited for the lock.
         if let Some((pid, version)) = read_pid_file(&self.project_root)
-            && is_pid_alive(pid)
-            && version == tracey_proto::PROTOCOL_VERSION
-            && let Ok(stream) = connect_local_endpoint(&endpoint).await
         {
-            debug!(
-                "Daemon became available while waiting for startup lock (pid={})",
-                pid
-            );
-            return Ok(stream);
+            if is_pid_alive(pid) && version == tracey_proto::PROTOCOL_VERSION {
+                match connect_local_endpoint(&endpoint).await {
+                    Ok(stream) => {
+                        debug!(
+                            "Daemon became available while waiting for startup lock (pid={})",
+                            pid
+                        );
+                        return Ok(stream);
+                    }
+                    Err(e) if is_transient_live_daemon_connect_error(&e) => {
+                        let busy_grace = Duration::from_secs(5);
+                        debug!(
+                            "Daemon PID {} still alive after startup lock but endpoint is busy ({}); waiting {:?}",
+                            pid, e, busy_grace
+                        );
+                        if let Some(stream) = self
+                            .wait_for_existing_daemon(pid, &endpoint, busy_grace)
+                            .await?
+                        {
+                            return Ok(stream);
+                        }
+                        return Err(live_daemon_busy_timeout_error(pid, &endpoint, busy_grace));
+                    }
+                    Err(_) => {}
+                }
+            }
         }
 
         debug!(
@@ -690,5 +753,22 @@ impl DaemonConnector {
         );
         self.spawn_daemon()?;
         self.wait_and_connect().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_live_daemon_connect_error_matches_platform_behavior() {
+        let error = io::Error::from_raw_os_error(231);
+        assert_eq!(is_transient_live_daemon_connect_error(&error), cfg!(windows));
+    }
+
+    #[test]
+    fn non_pipe_busy_errors_are_not_treated_as_transient_live_daemon_errors() {
+        let error = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
+        assert!(!is_transient_live_daemon_connect_error(&error));
     }
 }
