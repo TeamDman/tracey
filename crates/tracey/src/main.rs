@@ -14,6 +14,16 @@ use std::process::{Command as ProcessCommand, Stdio};
 // Use the library crate
 use tracey::{bridge, daemon, find_project_root};
 
+#[cfg(unix)]
+async fn connect_local_endpoint(endpoint: &Path) -> std::io::Result<roam_stream::LocalLink> {
+    roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await
+}
+
+#[cfg(windows)]
+async fn connect_local_endpoint(endpoint: &str) -> std::io::Result<roam_stream::LocalLink> {
+    roam_stream::LocalLink::connect(endpoint).await
+}
+
 /// CLI arguments
 #[derive(Debug, facet::Facet)]
 struct Args {
@@ -997,7 +1007,7 @@ async fn show_status(root: Option<PathBuf>, json: bool) -> Result<()> {
     let endpoint = daemon::local_endpoint(&project_root);
 
     // Try to connect without auto-starting
-    let stream = match roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await {
+    let stream = match connect_local_endpoint(&endpoint).await {
         Ok(s) => s,
         Err(_) => {
             if json {
@@ -1390,7 +1400,7 @@ async fn kill_daemon(root: Option<PathBuf>) -> Result<()> {
     }
 
     // Try to connect and send shutdown
-    match roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await {
+    match connect_local_endpoint(&endpoint).await {
         Ok(stream) => {
             let (client, _session_handle) = roam::initiator(stream)
                 .establish::<tracey_proto::TraceyDaemonClient>(())

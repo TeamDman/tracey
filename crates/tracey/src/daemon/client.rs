@@ -25,6 +25,16 @@ pub fn new_client(project_root: PathBuf) -> DaemonClient {
     DaemonClient { project_root }
 }
 
+#[cfg(unix)]
+async fn connect_local_endpoint(endpoint: &Path) -> io::Result<roam_stream::LocalLink> {
+    roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await
+}
+
+#[cfg(windows)]
+async fn connect_local_endpoint(endpoint: &str) -> io::Result<roam_stream::LocalLink> {
+    roam_stream::LocalLink::connect(endpoint).await
+}
+
 impl DaemonClient {
     async fn connect_inner(&self) -> io::Result<roam_stream::LocalLink> {
         let start = Instant::now();
@@ -534,7 +544,7 @@ impl DaemonConnector {
                 ));
             }
 
-            match roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await {
+            match connect_local_endpoint(&endpoint).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     last_connect_error = Some(e.to_string());
@@ -599,7 +609,7 @@ impl DaemonConnector {
 
                 if alive && version_ok {
                     // Happy path: daemon should be running.
-                    match roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await {
+                    match connect_local_endpoint(&endpoint).await {
                         Ok(stream) => return Ok(stream),
                         Err(e) => {
                             let age = pid_file_age(&self.project_root);
@@ -665,7 +675,7 @@ impl DaemonConnector {
         if let Some((pid, version)) = read_pid_file(&self.project_root)
             && is_pid_alive(pid)
             && version == tracey_proto::PROTOCOL_VERSION
-            && let Ok(stream) = roam_stream::LocalLink::connect(&endpoint.to_string_lossy()).await
+            && let Ok(stream) = connect_local_endpoint(&endpoint).await
         {
             debug!(
                 "Daemon became available while waiting for startup lock (pid={})",
