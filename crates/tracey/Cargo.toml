@@ -110,6 +110,7 @@ tracey-config = { workspace = true }
 facet-typescript = { workspace = true }
 facet-styx = { workspace = true }
 time = { workspace = true, features = ["formatting"] }
+which = "8.0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
