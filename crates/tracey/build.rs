@@ -282,17 +282,17 @@ fn build_dashboard() {
     copy_dir_recursive(dashboard_src, &dashboard_out);
     let dashboard_dir = &dashboard_out;
 
-    // Check if node is available
-    let node_check = shell_command("node").arg("--version").output();
+        // Check if node is available
+        let node_check = shell_command("node").arg("--version").output();
 
-    match node_check {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            eprintln!("Found node {}", version.trim());
-        }
-        _ => {
-            #[cfg(windows)]
-            panic!(
+        match node_check {
+                Ok(output) if output.status.success() => {
+                        let version = String::from_utf8_lossy(&output.stdout);
+                        eprintln!("Found node {}", version.trim());
+                }
+                _ => {
+                        #[cfg(windows)]
+                        panic!(
                                 "\n\
                                 Node.js is required but not found!\n\
                                 \n\
@@ -330,21 +330,21 @@ fn build_dashboard() {
                                 \n\
                                 See https://nodejs.org/en/download for more options.\n"
                         );
+                }
         }
-    }
 
     // Check if pnpm is available
     let pnpm_check = shell_command("pnpm").arg("version").output();
 
-    match pnpm_check {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            eprintln!("Found pnpm {}", version.trim());
-        }
-        _ => {
-            #[cfg(windows)]
-            panic!(
-                "\n\
+        match pnpm_check {
+                Ok(output) if output.status.success() => {
+                        let version = String::from_utf8_lossy(&output.stdout);
+                        eprintln!("Found pnpm {}", version.trim());
+                }
+                _ => {
+                        #[cfg(windows)]
+                        panic!(
+                                "\n\
                                 pnpm is required but not found!\n\
                                 \n\
                                 Install pnpm using one of the following methods:\n\
@@ -365,11 +365,11 @@ fn build_dashboard() {
                                     pnpm -v\n\
                                 \n\
                                 See https://pnpm.io/installation for more options.\n"
-            );
+                        );
 
-            #[cfg(not(windows))]
-            panic!(
-                "\n\
+                        #[cfg(not(windows))]
+                        panic!(
+                                "\n\
                                 pnpm is required but not found!\n\
                                 \n\
                                 Install pnpm using one of the following methods:\n\
@@ -387,9 +387,9 @@ fn build_dashboard() {
                                     curl -fsSL https://get.pnpm.io/install.sh | sh -\n\
                                 \n\
                                 See https://pnpm.io/installation for more options.\n"
-            );
+                        );
+                }
         }
-    }
 
     eprintln!("Building dashboard with pnpm...");
 
