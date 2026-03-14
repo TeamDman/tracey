@@ -282,114 +282,114 @@ fn build_dashboard() {
     copy_dir_recursive(dashboard_src, &dashboard_out);
     let dashboard_dir = &dashboard_out;
 
-        // Check if node is available
-        let node_check = shell_command("node").arg("--version").output();
+    // Check if node is available
+    let node_check = shell_command("node").arg("--version").output();
 
-        match node_check {
-                Ok(output) if output.status.success() => {
-                        let version = String::from_utf8_lossy(&output.stdout);
-                        eprintln!("Found node {}", version.trim());
-                }
-                _ => {
-                        #[cfg(windows)]
-                        panic!(
-                                "\n\
-                                Node.js is required but not found!\n\
-                                \n\
-                                Install Node.js using Chocolatey:\n\
-                                \n\
-                                    # First, install Chocolatey (if not already installed):\n\
-                                    powershell -c \"irm https://community.chocolatey.org/install.ps1|iex\"\n\
-                                \n\
-                                    # Then install Node.js:\n\
-                                    choco install nodejs\n\
-                                \n\
-                                    # Verify installation:\n\
-                                    node -v\n\
-                                \n\
-                                See https://nodejs.org/en/download for more options.\n"
-                        );
+    match node_check {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            eprintln!("Found node {}", version.trim());
+        }
+        _ => {
+            #[cfg(windows)]
+            panic!(
+                "\n\
+                Node.js is required but not found!\n\
+                \n\
+                Install Node.js using Chocolatey:\n\
+                \n\
+                  # First, install Chocolatey (if not already installed):\n\
+                  powershell -c \"irm https://community.chocolatey.org/install.ps1|iex\"\n\
+                \n\
+                  # Then install Node.js:\n\
+                  choco install nodejs\n\
+                \n\
+                  # Verify installation:\n\
+                  node -v\n\
+                \n\
+                See https://nodejs.org/en/download for more options.\n"
+            );
 
             #[cfg(not(windows))]
             panic!(
-                                "\n\
-                                Node.js is required but not found!\n\
-                                \n\
-                                Install Node.js using one of the following methods:\n\
-                                \n\
-                                    # On macOS with Homebrew:\n\
-                                    brew install node\n\
-                                \n\
-                                    # Using fnm (Fast Node Manager):\n\
-                                    curl -fsSL https://fnm.vercel.app/install | bash\n\
-                                    fnm install --lts\n\
-                                \n\
-                                    # Using nvm (Node Version Manager):\n\
-                                    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash\n\
-                                    nvm install --lts\n\
-                                \n\
-                                See https://nodejs.org/en/download for more options.\n"
-                        );
-                }
+                "\n\
+                Node.js is required but not found!\n\
+                \n\
+                Install Node.js using one of the following methods:\n\
+                \n\
+                  # On macOS with Homebrew:\n\
+                  brew install node\n\
+                \n\
+                  # Using fnm (Fast Node Manager):\n\
+                  curl -fsSL https://fnm.vercel.app/install | bash\n\
+                  fnm install --lts\n\
+                \n\
+                  # Using nvm (Node Version Manager):\n\
+                  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash\n\
+                  nvm install --lts\n\
+                \n\
+                See https://nodejs.org/en/download for more options.\n"
+            );
         }
+    }
 
     // Check if pnpm is available
     let pnpm_check = shell_command("pnpm").arg("version").output();
 
-        match pnpm_check {
-                Ok(output) if output.status.success() => {
-                        let version = String::from_utf8_lossy(&output.stdout);
-                        eprintln!("Found pnpm {}", version.trim());
-                }
-                _ => {
-                        #[cfg(windows)]
-                        panic!(
-                                "\n\
-                                pnpm is required but not found!\n\
-                                \n\
-                                Install pnpm using one of the following methods:\n\
-                                \n\
-                                    # Using npm (recommended):\n\
-                                    npm install -g pnpm\n\
-                                \n\
-                                    # Using Chocolatey:\n\
-                                    choco install pnpm\n\
-                                \n\
-                                    # Using winget:\n\
-                                    winget install -e --id pnpm.pnpm\n\
-                                \n\
-                                    # Using Scoop:\n\
-                                    scoop install pnpm\n\
-                                \n\
-                                    # Verify installation:\n\
-                                    pnpm -v\n\
-                                \n\
-                                See https://pnpm.io/installation for more options.\n"
-                        );
-
-                        #[cfg(not(windows))]
-                        panic!(
-                                "\n\
-                                pnpm is required but not found!\n\
-                                \n\
-                                Install pnpm using one of the following methods:\n\
-                                \n\
-                                    # Using Corepack (recommended, included with Node.js 16.13+):\n\
-                                    corepack enable pnpm\n\
-                                \n\
-                                    # Using npm:\n\
-                                    npm install -g pnpm\n\
-                                \n\
-                                    # On macOS with Homebrew:\n\
-                                    brew install pnpm\n\
-                                \n\
-                                    # Standalone script:\n\
-                                    curl -fsSL https://get.pnpm.io/install.sh | sh -\n\
-                                \n\
-                                See https://pnpm.io/installation for more options.\n"
-                        );
-                }
+    match pnpm_check {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            eprintln!("Found pnpm {}", version.trim());
         }
+        _ => {
+            #[cfg(windows)]
+            panic!(
+                "\n\
+                pnpm is required but not found!\n\
+                \n\
+                Install pnpm using one of the following methods:\n\
+                \n\
+                  # Using npm (recommended):\n\
+                  npm install -g pnpm\n\
+                \n\
+                  # Using Chocolatey:\n\
+                  choco install pnpm\n\
+                \n\
+                  # Using winget:\n\
+                  winget install -e --id pnpm.pnpm\n\
+                \n\
+                  # Using Scoop:\n\
+                  scoop install pnpm\n\
+                \n\
+                  # Verify installation:\n\
+                  pnpm -v\n\
+                \n\
+                See https://pnpm.io/installation for more options.\n"
+            );
+
+            #[cfg(not(windows))]
+            panic!(
+                "\n\
+                pnpm is required but not found!\n\
+                \n\
+                Install pnpm using one of the following methods:\n\
+                \n\
+                  # Using Corepack (recommended, included with Node.js 16.13+):\n\
+                  corepack enable pnpm\n\
+                \n\
+                  # Using npm:\n\
+                  npm install -g pnpm\n\
+                \n\
+                  # On macOS with Homebrew:\n\
+                  brew install pnpm\n\
+                \n\
+                  # Standalone script:\n\
+                  curl -fsSL https://get.pnpm.io/install.sh | sh -\n\
+                \n\
+                See https://pnpm.io/installation for more options.\n"
+            );
+        }
+    }
 
     eprintln!("Building dashboard with pnpm...");
 
