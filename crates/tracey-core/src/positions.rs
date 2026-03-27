@@ -6,7 +6,6 @@ impl LineNumber {
         Self(index + 1)
     }
 
-    #[cfg(not(feature = "reverse"))]
     pub(crate) fn from_one_based(index: usize) -> Self {
         debug_assert!(index > 0, "line numbers are 1-based");
         Self(index)
@@ -116,11 +115,9 @@ impl RefLocation {
     }
 }
 
-#[cfg(not(feature = "reverse"))]
 #[derive(Debug, Clone)]
 pub(crate) struct LineStarts(Vec<ByteOffset>);
 
-#[cfg(not(feature = "reverse"))]
 impl LineStarts {
     pub(crate) fn from_content(content: &str) -> Self {
         let starts = std::iter::once(ByteOffset::ZERO)

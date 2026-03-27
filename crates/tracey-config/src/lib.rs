@@ -62,6 +62,11 @@ pub struct Impl {
     #[facet(default)]
     pub exclude: Vec<String>,
 
+    /// Glob patterns for plain-text files to scan without language-specific parsing
+    /// r[impl config.impl.include_plain]
+    #[facet(default)]
+    pub include_plain: Vec<String>,
+
     /// Glob patterns for test files (only verify annotations allowed)
     /// r[impl config.impl.test_include]
     #[facet(default)]

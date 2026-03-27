@@ -91,7 +91,7 @@ pub struct DashboardData {
 
 #[derive(Default)]
 pub struct BuildCache {
-    source_files: HashMap<PathBuf, CachedSourceFile>,
+    source_files: HashMap<(PathBuf, ImplScanMode), CachedSourceFile>,
     impl_scan_paths: HashMap<ImplScanKey, CachedScanPaths>,
     spec_scan_paths: HashMap<SpecScanKey, CachedScanPaths>,
     markdown_files: HashMap<PathBuf, CachedMarkdownFile>,
@@ -106,6 +106,12 @@ struct CachedSourceFile {
     refs: Vec<ReqReference>,
     parse_warnings: Vec<ParseWarning>,
     code_units: Vec<CodeUnit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ImplScanMode {
+    Parsed,
+    PlainText,
 }
 
 #[derive(Default)]
@@ -609,7 +615,18 @@ async fn get_cached_source_file(
     cache: &mut BuildCache,
     stats: &mut CacheStats,
 ) -> std::io::Result<CachedSourceFile> {
+    get_cached_source_file_with_mode(path, overlay, cache, stats, ImplScanMode::Parsed).await
+}
+
+async fn get_cached_source_file_with_mode(
+    path: &Path,
+    overlay: &FileOverlay,
+    cache: &mut BuildCache,
+    stats: &mut CacheStats,
+    mode: ImplScanMode,
+) -> std::io::Result<CachedSourceFile> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let cache_key = (canonical.clone(), mode);
 
     let overlay_content = overlay
         .get(path)
@@ -618,15 +635,21 @@ async fn get_cached_source_file(
 
     if let Some(content) = overlay_content {
         let content_hash = compute_content_hash(&content);
-        if let Some(entry) = cache.source_files.get(&canonical)
+        if let Some(entry) = cache.source_files.get(&cache_key)
             && entry.content_hash == content_hash
         {
             stats.hash_hits += 1;
             return Ok(entry.clone());
         }
 
-        let reqs = Reqs::extract_from_content(&canonical, &content);
-        let code_units = tracey_core::code_units::extract(&canonical, &content).units;
+        let reqs = match mode {
+            ImplScanMode::Parsed => Reqs::extract_from_content(&canonical, &content),
+            ImplScanMode::PlainText => Reqs::extract_from_plain_text(&canonical, &content),
+        };
+        let code_units = match mode {
+            ImplScanMode::Parsed => tracey_core::code_units::extract(&canonical, &content).units,
+            ImplScanMode::PlainText => Vec::new(),
+        };
         let parsed = CachedSourceFile {
             content_hash,
             file_len: content.len() as u64,
@@ -638,7 +661,7 @@ async fn get_cached_source_file(
         };
         stats.misses += 1;
         stats.reparsed += 1;
-        cache.source_files.insert(canonical, parsed.clone());
+        cache.source_files.insert(cache_key, parsed.clone());
         return Ok(parsed);
     }
 
@@ -646,7 +669,7 @@ async fn get_cached_source_file(
     let file_len = metadata.len();
     let modified_nanos = metadata.modified().ok().and_then(file_modified_nanos);
 
-    if let Some(entry) = cache.source_files.get(&canonical)
+    if let Some(entry) = cache.source_files.get(&cache_key)
         && entry.file_len == file_len
         && entry.modified_nanos == modified_nanos
     {
@@ -657,19 +680,25 @@ async fn get_cached_source_file(
     let content = read_file_with_overlay(&canonical, overlay).await?;
     let content_hash = compute_content_hash(&content);
 
-    if let Some(entry) = cache.source_files.get(&canonical)
+    if let Some(entry) = cache.source_files.get(&cache_key)
         && entry.content_hash == content_hash
     {
         let mut updated = entry.clone();
         updated.file_len = file_len;
         updated.modified_nanos = modified_nanos;
-        cache.source_files.insert(canonical, updated.clone());
+        cache.source_files.insert(cache_key, updated.clone());
         stats.hash_hits += 1;
         return Ok(updated);
     }
 
-    let reqs = Reqs::extract_from_content(&canonical, &content);
-    let code_units = tracey_core::code_units::extract(&canonical, &content).units;
+    let reqs = match mode {
+        ImplScanMode::Parsed => Reqs::extract_from_content(&canonical, &content),
+        ImplScanMode::PlainText => Reqs::extract_from_plain_text(&canonical, &content),
+    };
+    let code_units = match mode {
+        ImplScanMode::Parsed => tracey_core::code_units::extract(&canonical, &content).units,
+        ImplScanMode::PlainText => Vec::new(),
+    };
     let parsed = CachedSourceFile {
         content_hash,
         file_len,
@@ -681,7 +710,7 @@ async fn get_cached_source_file(
     };
     stats.misses += 1;
     stats.reparsed += 1;
-    cache.source_files.insert(canonical, parsed.clone());
+    cache.source_files.insert(cache_key, parsed.clone());
     Ok(parsed)
 }
 
@@ -1195,6 +1224,70 @@ async fn scan_impl_files(
         parse_failures,
         warnings,
         code_units_by_file,
+        file_contents,
+        reqs_by_file,
+        did_full_walk,
+    )
+}
+
+async fn scan_plain_impl_files(
+    project_root: &Path,
+    include: &[String],
+    exclude: &[String],
+    overlay: &FileOverlay,
+    cache: &mut BuildCache,
+    changed_files: &[PathBuf],
+    stats: &mut CacheStats,
+) -> (
+    Vec<ReqReference>,
+    Vec<ParseWarning>,
+    Vec<(PathBuf, String)>,
+    Vec<String>,
+    BTreeMap<PathBuf, String>,
+    BTreeMap<PathBuf, Reqs>,
+    bool,
+) {
+    let (mut files, warnings, did_full_walk) =
+        get_cached_impl_scan_paths(project_root, include, exclude, changed_files, cache);
+    let (impl_roots, _) = build_scan_roots(project_root, include);
+    for overlay_path in overlay.keys() {
+        if path_matches_any_root(overlay_path, &impl_roots)
+            && !path_matches_excludes(overlay_path, &impl_roots, exclude)
+        {
+            files.insert(overlay_path.clone());
+        }
+    }
+    let mut refs = Vec::new();
+    let mut parse_warnings = Vec::new();
+    let mut parse_failures = Vec::new();
+    let mut file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
+    let mut reqs_by_file: BTreeMap<PathBuf, Reqs> = BTreeMap::new();
+    for path in files {
+        match get_cached_source_file_with_mode(&path, overlay, cache, stats, ImplScanMode::PlainText)
+            .await
+        {
+            Ok(parsed) => {
+                reqs_by_file.insert(
+                    path.clone(),
+                    Reqs {
+                        references: parsed.refs.clone(),
+                        warnings: parsed.parse_warnings.clone(),
+                    },
+                );
+                refs.extend(parsed.refs);
+                parse_warnings.extend(parsed.parse_warnings);
+                file_contents.insert(path, parsed.content);
+            }
+            Err(err) => {
+                parse_failures.push((path, format!("failed to read/parse file: {err}")));
+            }
+        }
+    }
+    (
+        refs,
+        parse_warnings,
+        parse_failures,
+        warnings,
         file_contents,
         reqs_by_file,
         did_full_walk,
@@ -1770,7 +1863,7 @@ fn compute_validation_by_impl(
                 errors.push(ValidationError {
                     code: ValidationErrorCode::IncludeUnparseableFile,
                     message: format!(
-                        "Include discovered '{rel_path}' but Tracey could not parse it ({reason}). Supported file types: {supported_file_types}. To fix this, either move/rename annotations to a supported file type, or update include/exclude patterns so this file is not scanned."
+                        "Include discovered '{rel_path}' but Tracey could not parse it ({reason}). Supported file types: {supported_file_types}. To fix this, either move/rename annotations to a supported file type, use include_plain for text files such as README/config/license artifacts, or update include/exclude patterns so this file is not scanned."
                     ),
                     file: Some(config_rel_path.clone()),
                     line: Some(1),
@@ -2587,6 +2680,7 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
                 impl_config.include.to_vec()
             };
             let exclude: Vec<String> = impl_config.exclude.to_vec();
+            let include_plain: Vec<String> = impl_config.include_plain.to_vec();
             let impl_key: ImplKey = (spec_name.clone(), impl_name.clone());
             let (
                 mut refs,
@@ -2616,6 +2710,49 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
                     .or_default()
                     .entry(path)
                     .or_insert(reason);
+            }
+
+            if !include_plain.is_empty() {
+                let (
+                    plain_refs,
+                    plain_parse_warnings,
+                    plain_parse_failures,
+                    plain_scan_warnings,
+                    plain_file_contents,
+                    plain_source_reqs_by_file,
+                    plain_walk_full_scan,
+                ) = scan_plain_impl_files(
+                    project_root,
+                    &include_plain,
+                    &exclude,
+                    overlay,
+                    cache,
+                    changed_files,
+                    &mut cache_stats,
+                )
+                .await;
+                refs.extend(plain_refs);
+                parse_warnings.extend(plain_parse_warnings);
+                for (path, reason) in plain_parse_failures {
+                    include_parse_failures
+                        .entry(path.clone())
+                        .or_insert_with(|| reason.clone());
+                    include_parse_failures_by_impl
+                        .entry(impl_key.clone())
+                        .or_default()
+                        .entry(path)
+                        .or_insert(reason);
+                }
+                for w in plain_scan_warnings {
+                    if !quiet {
+                        eprintln!("{}", w.yellow());
+                    }
+                }
+                impl_file_contents.extend(plain_file_contents);
+                for (path, reqs) in plain_source_reqs_by_file {
+                    impl_source_reqs_by_file.entry(path).or_insert(reqs);
+                }
+                impl_walk_full_scan = impl_walk_full_scan || plain_walk_full_scan;
             }
 
             // r[impl config.impl.test_include.extraction]

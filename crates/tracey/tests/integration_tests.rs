@@ -1372,3 +1372,114 @@ async fn test_test_include_counts_toward_verified() {
         impl_status.verified_rules
     );
 }
+
+#[tokio::test]
+async fn test_include_plain_extracts_refs_from_text_files() {
+    let temp = common::create_temp_project();
+
+    std::fs::write(
+        temp.path().join("config.styx"),
+        r#"
+specs (
+  {
+    name test
+    include (spec.md)
+    impls (
+      {
+        name repo
+        include (src/**/*.rs)
+        include_plain (
+          README.md
+          Cargo.toml
+          .config/tracey/config.styx
+          LICENSE
+        )
+      }
+    )
+  }
+)
+"#,
+    )
+    .expect("Failed to write config");
+
+    std::fs::create_dir_all(temp.path().join(".config/tracey"))
+        .expect("Failed to create tracey config dir");
+    std::fs::write(
+        temp.path().join("README.md"),
+        "<!-- r[impl auth.login] -->\n<!-- r[impl auth.session] -->\n",
+    )
+    .expect("Failed to write README");
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        "# r[impl auth.session]\n[package]\nname = \"demo\"\n",
+    )
+    .expect("Failed to write Cargo.toml");
+    std::fs::write(
+        temp.path().join(".config/tracey/config.styx"),
+        "// r[impl data.required-fields]\n",
+    )
+    .expect("Failed to write nested config");
+    std::fs::write(temp.path().join("LICENSE"), "r[impl auth.login]\n")
+        .expect("Failed to write LICENSE");
+
+    let engine = Arc::new(
+        tracey::daemon::Engine::new(temp.path().to_path_buf(), temp.path().join("config.styx"))
+            .await
+            .expect("Failed to create engine"),
+    );
+    let service = tracey::daemon::TraceyService::new(engine);
+    let service = common::create_test_rpc_service(service).await;
+
+    let result = rpc(service
+        .client
+        .validate(ValidateRequest {
+            spec: Some("test".to_string()),
+            impl_name: Some("repo".to_string()),
+        })
+        .await);
+
+    assert!(
+        result
+            .errors
+            .iter()
+            .all(|error| error.code != ValidationErrorCode::IncludeUnparseableFile),
+        "Expected include_plain files to avoid IncludeUnparseableFile, got: {:?}",
+        result.errors
+    );
+
+    let auth_login = rpc(service.client.rule(rid("auth.login")).await).expect("rule should exist");
+    let repo_coverage = auth_login
+        .coverage
+        .iter()
+        .find(|coverage| coverage.impl_name == "repo")
+        .expect("Expected repo impl coverage");
+    assert!(
+        repo_coverage.impl_refs.len() >= 2,
+        "Expected refs from README and LICENSE, got {:?}",
+        repo_coverage.impl_refs
+    );
+
+    let auth_session = rpc(service.client.rule(rid("auth.session")).await).expect("rule should exist");
+    let repo_coverage = auth_session
+        .coverage
+        .iter()
+        .find(|coverage| coverage.impl_name == "repo")
+        .expect("Expected repo impl coverage");
+    assert!(
+        repo_coverage.impl_refs.len() >= 2,
+        "Expected refs from README and Cargo.toml, got {:?}",
+        repo_coverage.impl_refs
+    );
+
+    let required_fields = rpc(service.client.rule(rid("data.required-fields")).await)
+        .expect("rule should exist");
+    let repo_coverage = required_fields
+        .coverage
+        .iter()
+        .find(|coverage| coverage.impl_name == "repo")
+        .expect("Expected repo impl coverage");
+    assert!(
+        !repo_coverage.impl_refs.is_empty(),
+        "Expected ref from .config/tracey/config.styx"
+    );
+}

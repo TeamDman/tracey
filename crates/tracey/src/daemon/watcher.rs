@@ -263,10 +263,20 @@ pub fn extract_watch_dirs_from_config(config: &Config, project_root: &Path) -> H
             }
         }
 
-        // Impl include and test_include patterns
+        // Impl include, include_plain, and test_include patterns
         for impl_ in &spec.impls {
             for include in &impl_.include {
                 let dir = glob_to_watch_dir(include);
+                let full_path = project_root.join(&dir);
+                if let Some(canonical) =
+                    full_path.canonicalize().ok().and_then(normalize_watch_path)
+                {
+                    dirs.insert(canonical);
+                }
+            }
+
+            for include_plain in &impl_.include_plain {
+                let dir = glob_to_watch_dir(include_plain);
                 let full_path = project_root.join(&dir);
                 if let Some(canonical) =
                     full_path.canonicalize().ok().and_then(normalize_watch_path)

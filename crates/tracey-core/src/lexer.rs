@@ -4,10 +4,8 @@
 //! It scans comments for patterns like `r[verb rule.id]`.
 
 use crate::RuleId;
-#[cfg(not(feature = "reverse"))]
 use crate::parse_rule_id;
 use crate::positions::ByteSpan;
-#[cfg(not(feature = "reverse"))]
 use crate::positions::{ByteOffset, LineNumber, LineStarts, RefLocation};
 use crate::sources::{ExtractionResult, Sources};
 use eyre::Result;
@@ -171,6 +169,20 @@ impl Reqs {
         reqs
     }
 
+    /// Extract requirements from arbitrary plain text (no language-specific parsing)
+    pub fn extract_from_plain_text(path: &Path, content: &str) -> Self {
+        let mut reqs = Reqs::new();
+        extract_references_from_text(
+            path,
+            content,
+            ByteOffset::ZERO,
+            LineNumber::from_one_based(1),
+            &[],
+            &mut reqs,
+        );
+        reqs
+    }
+
     /// Merge another Reqs into this one
     pub fn extend(&mut self, other: Reqs) {
         self.references.extend(other.references);
@@ -228,7 +240,6 @@ pub(crate) fn extract_from_content(path: &Path, content: &str, reqs: &mut Reqs) 
 /// State for tracking ignore directives across lines.
 ///
 /// r[impl ref.ignore.prefix]
-#[cfg(not(feature = "reverse"))]
 #[derive(Default)]
 struct IgnoreState {
     /// Skip the next line (set by @tracey:ignore-next-line)
@@ -241,7 +252,6 @@ struct IgnoreState {
 /// Check if a comment contains ignore directives and update state accordingly.
 ///
 /// Returns true if the current comment's refs should be extracted (not ignored).
-#[cfg(not(feature = "reverse"))]
 fn check_ignore_directives(text: &str, line: LineNumber, state: &mut IgnoreState) -> bool {
     // Check for ignore directives
     // r[impl ref.ignore.next-line]
@@ -278,7 +288,6 @@ fn check_ignore_directives(text: &str, line: LineNumber, state: &mut IgnoreState
     true
 }
 
-#[cfg(not(feature = "reverse"))]
 fn extract_from_content_text_based(path: &Path, content: &str, reqs: &mut Reqs) {
     // Track line starts for computing line numbers from byte offsets
     let line_starts = LineStarts::from_content(content);
@@ -351,7 +360,6 @@ fn extract_from_content_text_based(path: &Path, content: &str, reqs: &mut Reqs) 
 }
 
 /// Extract rule references from a piece of text (comment content)
-#[cfg(not(feature = "reverse"))]
 fn extract_references_from_text(
     path: &Path,
     text: &str,
@@ -579,7 +587,6 @@ fn extract_references_from_text(
 }
 
 // r[impl ref.syntax.req-id+3]
-#[cfg(not(feature = "reverse"))]
 fn is_valid_req_id(req_id: &str) -> bool {
     let Some(parsed) = parse_rule_id(req_id) else {
         return false;

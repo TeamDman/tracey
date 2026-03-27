@@ -506,6 +506,9 @@ Each impl configuration MAY have an `include` field with one or more glob patter
 r[config.impl.exclude]
 Each impl configuration MAY have an `exclude` field with one or more glob patterns for source files to exclude.
 
+r[config.impl.include_plain]
+Each impl configuration MAY have an `include_plain` field with one or more glob patterns for plain-text files whose requirement references should be extracted without language-specific parsing.
+
 r[config.impl.test_include]
 Each impl configuration MAY have a `test_include` field with one or more glob patterns for test files to scan.
 
