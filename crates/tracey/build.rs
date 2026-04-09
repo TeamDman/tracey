@@ -15,26 +15,27 @@ use time::OffsetDateTime;
 fn shell_command(program: &str) -> Command {
     #[cfg(windows)]
     {
-        if let Some(path) = resolve_windows_command(program) {
+        let mut cmd = if let Some(path) = resolve_windows_command(program) {
             let extension = command_extension(&path);
 
             if matches!(extension.as_deref(), Some("cmd" | "bat")) {
                 let mut cmd = Command::new("cmd.exe");
                 cmd.args(["/d", "/c"]);
                 cmd.arg(path);
-                if let Some(path) = windows_shell_path() {
-                    cmd.env("PATH", path);
-                }
-                return cmd;
+                cmd
+            } else if matches!(extension.as_deref(), Some("exe" | "com")) {
+                Command::new(path)
+            } else {
+                let mut cmd = Command::new("cmd.exe");
+                cmd.args(["/d", "/c", program]);
+                cmd
             }
+        } else {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.args(["/d", "/c", program]);
+            cmd
+        };
 
-            if matches!(extension.as_deref(), Some("exe" | "com")) {
-                return Command::new(path);
-            }
-        }
-
-        let mut cmd = Command::new("cmd.exe");
-        cmd.args(["/d", "/c", program]);
         if let Some(path) = windows_shell_path() {
             cmd.env("PATH", path);
         }
@@ -69,7 +70,30 @@ fn resolve_windows_command(program: &str) -> Option<PathBuf> {
 fn windows_shell_path() -> Option<OsString> {
     let mut paths = Vec::<PathBuf>::new();
 
-    for program in ["node", "npm", "npm.cmd", "pnpm", "pnpm.cmd"] {
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&existing_path) {
+            if !paths.iter().any(|existing| existing == &path) {
+                paths.push(path);
+            }
+        }
+    }
+
+    for name in ["PNPM_HOME", "COREPACK_HOME"] {
+        if let Some(path) = std::env::var_os(name).map(PathBuf::from) {
+            if !paths.iter().any(|existing| existing == &path) {
+                paths.push(path);
+            }
+        }
+    }
+
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let pnpm_home = PathBuf::from(local_app_data).join("pnpm");
+        if !paths.iter().any(|existing| existing == &pnpm_home) {
+            paths.push(pnpm_home);
+        }
+    }
+
+    for program in ["node", "npm", "npm.cmd", "pnpm", "pnpm.cmd", "pnpm.exe"] {
         if let Some(path) =
             resolve_windows_command(program).and_then(|path| path.parent().map(Path::to_path_buf))
         {
@@ -334,7 +358,7 @@ fn build_dashboard() {
     }
 
     // Check if pnpm is available
-    let pnpm_check = shell_command("pnpm").arg("version").output();
+    let pnpm_check = shell_command("pnpm").arg("--version").output();
 
     match pnpm_check {
         Ok(output) if output.status.success() => {
